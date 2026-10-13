@@ -40,9 +40,9 @@ csr_fixture() { mkdir -p "$csr_tmp/$1/.github/workflows"; cat > "$csr_tmp/$1/.gi
 
 csr_tmp="$(mktemp -d)"
 csr_fixture mixed <<'WF'
-      - uses: aleo-labs-flex/gh-actions/.github/actions/x@some-branch
-      - uses: "aleo-labs-flex/gh-actions/.github/actions/y@trial"
-      - uses: aleo-labs-flex/gh-actions/.github/actions/z@v1
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/x@some-branch
+      - uses: "aleo-labs-protocol/gh-actions/.github/actions/y@trial"
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/z@v1
 WF
 ck "the pin check catches an unpinned ref, quoted or not" \
    "$(csr_out "$csr_tmp/mixed" | grep -c 'gh-actions/.github/actions/[xy]@')" "2"
@@ -50,12 +50,12 @@ ck "and does not flag a pinned one" \
    "$(csr_out "$csr_tmp/mixed" | grep -c '@v1')" "0"
 # The role trusts the workflow only at a tag, so a SHA pin is a denial at STS.
 csr_fixture sha <<'WF'
-      - uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@0123456789abcdef0123456789abcdef01234567
+      - uses: aleo-labs-protocol/gh-actions/.github/workflows/start-runner.yml@0123456789abcdef0123456789abcdef01234567
 WF
 ck "a SHA pin fails here rather than at STS" "$(csr_rc "$csr_tmp/sha")" "1"
 # Another org's repo of the same name is not this one, and its refs are theirs.
 csr_fixture foreign <<'WF'
-      - uses: aleo-labs-flex/gh-actions/.github/actions/z@v1
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/z@v1
       - uses: someone-else/gh-actions/.github/actions/x@main
 WF
 ck "another org's gh-actions is not held to the pin" "$(csr_rc "$csr_tmp/foreign")" "0"
@@ -63,13 +63,14 @@ ck "another org's gh-actions is not held to the pin" "$(csr_rc "$csr_tmp/foreign
 # trusted, so it has to fail here, in the caller's PR -- pinned or not, and
 # whichever org or old name it was written with.
 csr_fixture old <<'WF'
-      - uses: aleo-labs-flex/gh-actions/.github/actions/z@v1
-      - uses: aleo-labs-flex/aws-dev-infra/.github/actions/x@v1
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/z@v1
+      - uses: aleo-labs-protocol/aws-dev-infra/.github/actions/x@v1
       - uses: "otherorg/aws-cuda-dev/.github/actions/y@v1"
+      - uses: aleo-labs-flex/gh-actions/.github/actions/w@v1
 WF
 ck "a ref to where this code used to live fails" "$(csr_rc "$csr_tmp/old")" "1"
 ck "and names each one" \
-   "$(csr_out "$csr_tmp/old" | grep -cE '/(aws-dev-infra|aws-cuda-dev)/.github/actions/[xy]@v1')" "2"
+   "$(csr_out "$csr_tmp/old" | grep -cE '/(aws-dev-infra|aws-cuda-dev|gh-actions)/.github/actions/[xyw]@v1')" "3"
 csr_fixture none <<'WF'
       - uses: actions/checkout@v4
 WF
