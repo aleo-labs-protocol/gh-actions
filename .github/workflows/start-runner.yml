@@ -5,7 +5,7 @@
 # instances and the capacity ladder are the same mechanism whichever box it is;
 # only the inputs differ.
 #
-# Extracted from duplicated copies in aleo-labs-flex/snarkVM-cuda and aleo-labs-flex/dps,
+# Extracted from duplicated copies in aleo-labs-protocol/snarkVM-cuda and aleo-labs-protocol/dps,
 # where this job was 128 identical lines in each. It had been rewritten three
 # times in a day -- for GitHub's immutable OIDC subject claims, for the capacity
 # retry, and to fix a fallback whose target had silently become its own source --
@@ -20,7 +20,7 @@
 #
 #   jobs:
 #     start-runners:
-#       uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
+#       uses: aleo-labs-protocol/gh-actions/.github/workflows/start-runner.yml@v2
 #       permissions: { id-token: write, contents: read, actions: read }
 #       with:
 #         role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}

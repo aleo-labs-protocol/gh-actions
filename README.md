@@ -1,9 +1,9 @@
 # gh-actions
 
-The reusable workflow and composite actions that aleo-labs-flex repositories
+The reusable workflow and composite actions that aleo-labs-protocol repositories
 use to start and run on the self-hosted runner fleet. The fleet itself — the
 boxes, their provisioning and the AWS role this workflow assumes — is managed
-in the private `aleo-labs-flex/aws-dev-infra`.
+in the private `aleo-labs-protocol/aws-dev-infra`.
 
 This repository is public so that public repositories can call it: GitHub does
 not let a public repository use actions from a private one. Nothing here is
@@ -21,7 +21,7 @@ jobs:
   # is no second caller to keep in step with this one. actions:read is what lets
   # it count the queue; secrets: inherit carries the runner-census key.
   start-runners:
-    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
+    uses: aleo-labs-protocol/gh-actions/.github/workflows/start-runner.yml@v2
     permissions: { id-token: write, contents: read, actions: read }
     secrets: inherit
     with:
@@ -40,11 +40,11 @@ jobs:
     needs: start-runners
     runs-on: [self-hosted, linux, x64, gpu, sm_89]
     steps:
-      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-preflight@v2
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/gpu-runner-preflight@v2
       - uses: actions/checkout@v5
         with: { persist-credentials: false }
       - run: cargo test --release --features cuda      # your own command
-      - uses: aleo-labs-flex/gh-actions/.github/actions/gpu-runner-report@v2
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/gpu-runner-report@v2
         if: always()
 ```
 
@@ -83,8 +83,8 @@ while resolving no installation, which looks like a broken key and is not.
 Then store the two halves:
 
 ```sh
-gh variable set RUNNER_APP_ID  --org aleo-labs-flex --visibility all --body <app id>
-gh secret   set RUNNER_APP_KEY --org aleo-labs-flex --visibility all < path/to/key.pem
+gh variable set RUNNER_APP_ID  --org aleo-labs-protocol --visibility all --body <app id>
+gh secret   set RUNNER_APP_KEY --org aleo-labs-protocol --visibility all < path/to/key.pem
 ```
 
 The id is a **variable**, not a secret: it is not sensitive, and having it in
@@ -94,7 +94,7 @@ A caller then passes both through:
 
 ```yaml
   start-cpu-runners:
-    uses: aleo-labs-flex/gh-actions/.github/workflows/start-runner.yml@v2
+    uses: aleo-labs-protocol/gh-actions/.github/workflows/start-runner.yml@v2
     permissions: { id-token: write, contents: read, actions: read }
     with:
       role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}

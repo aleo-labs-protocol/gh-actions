@@ -15,7 +15,7 @@
 # Runs in the caller's checkout: the files it reads are theirs. Matched from
 # `uses:` on, not the bare path, so a comment naming the path is not a ref.
 name: Check shared refs
-description: Every aleo-labs-flex/gh-actions reference in .github/workflows must be pinned to a @vN release tag.
+description: Every aleo-labs-protocol/gh-actions reference in .github/workflows must be pinned to a @vN release tag.
 
 runs:
   using: composite
@@ -34,10 +34,10 @@ runs:
         # Owner-anchored: "gh-actions" is a common repo name, and another
         # org's would otherwise be held to this repo's pinning rule. Losing the
         # owner wildcard is safe because matching nothing is an error below.
-        all=$(refs 'aleo-labs-flex/gh-actions')
-        old=$(refs '[A-Za-z0-9._-]+/(aws-dev-infra|aws-cuda-dev)')
+        all=$(refs 'aleo-labs-protocol/gh-actions')
+        old=$(refs '[A-Za-z0-9._-]+/(aws-dev-infra|aws-cuda-dev)'; refs 'aleo-labs-flex/gh-actions')
         if [ -n "${old}" ]; then
-          echo "::error::these moved to aleo-labs-flex/gh-actions; repoint them:" >&2
+          echo "::error::these moved to aleo-labs-protocol/gh-actions; repoint them:" >&2
           printf '%s\n' "${old}" | sed 's/^/  /' >&2
           exit 1
         fi
