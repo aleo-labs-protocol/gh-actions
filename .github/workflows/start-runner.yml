@@ -27,7 +27,8 @@
 #         # Without this the census step is skipped and busy is 0: the key
 #         # alone mints nothing.
 #         runner-app-id: ${{ vars.RUNNER_APP_ID }}
-#       secrets: inherit
+#       secrets:
+#         runner_app_key: ${{ secrets.RUNNER_APP_KEY }}
 #       # Keep the fork guard in the CALLER, where whoever edits that file sees
 #       # it. It is also enforced here, as defence in depth.
 #       if: >-
