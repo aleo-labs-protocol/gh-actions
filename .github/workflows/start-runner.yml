@@ -5,12 +5,6 @@
 # instances and the capacity ladder are the same mechanism whichever box it is;
 # only the inputs differ.
 #
-# Extracted from duplicated copies in aleo-labs-protocol/snarkVM-cuda and aleo-labs-protocol/dps,
-# where this job was 128 identical lines in each. It had been rewritten three
-# times in a day -- for GitHub's immutable OIDC subject claims, for the capacity
-# retry, and to fix a fallback whose target had silently become its own source --
-# and every one of those was applied twice by hand. See aws-dev-infra#3.
-#
 # ONE caller job per fleet. It reconciles: it works out how many boxes the work
 # in front of it needs, compares that to how many are already up, and starts the
 # difference. There is no primary box and no overflow box, only a list of boxes
@@ -42,12 +36,11 @@
 #       ...
 #
 # The same workflow starts the CPU boxes for jobs that never needed a GPU: pass
-# `label: cpu`. See "A CPU box for the jobs that never needed a GPU" in the
-# aws-dev-infra README.
+# `label: cpu`.
 #
 # WHICH BOXES. The fleet is every box whose RunnerLabel tag is the label, in name
-# order, and each box steps down its own CapacityLadder tag. aws-dev-infra's
-# provision.sh writes both from the box's config, so no caller lists the boxes.
+# order, and each box steps down its own CapacityLadder tag. Provisioning
+# writes both from the box's config, so no caller lists the boxes.
 # StartInstances is still scoped by Name in IAM: a new box is started once
 # setup-oidc-role.sh has been re-run to admit it.
 #
@@ -69,7 +62,7 @@
 # another repo's work cannot take ours, so our own queue needs capacity ON TOP
 # of them. Without it, the second repository to arrive sees boxes already up,
 # concludes the fleet is big enough, and starts nothing while its jobs wait.
-# See aws-dev-infra#55; the credential is optional and busy falls back to 0.
+# The credential is optional, and busy falls back to 0.
 #
 # The floor of 1 is what keeps a miscount from hanging a run for 24h: a label
 # nobody offers, a caller that forgot actions:read, a rate-limited API all count
@@ -78,7 +71,7 @@
 #
 # The app must be SINGLE-PURPOSE. A key in CI secrets can mint every permission
 # its app holds, so the app that administers this fleet -- which can write org
-# secrets -- must not be the one whose key goes there. See aws-dev-infra#55.
+# secrets -- must not be the one whose key goes there.
 #
 # The role ARN is an INPUT rather than read from `vars` here on purpose: how the
 # `vars` context resolves inside a reusable workflow is not something to leave to
@@ -117,7 +110,7 @@ on:
           starting. This is a throughput/cost dial and the only number that
           decides fleet size, so it lives here rather than in each caller.
 
-          3 is calibrated against dps, the busiest caller: one PR's worth of cpu
+          3 is calibrated against the busiest caller: one PR's worth of cpu
           jobs wakes a couple of boxes, and each further PR in flight wakes
           more. More boxes for a single PR is more hardware than that PR can
           use; a box still asleep under several PRs' jobs is a queue nobody is
@@ -220,7 +213,7 @@ jobs:
               --output text) || { echo "::error::could not describe the ${LABEL} fleet" >&2; exit 1; }
           fleet=$(tr -s '[:space:]' '\n' <<<"${names}" | sed '/^$/d' | sort -uV | paste -sd' ' -)
           if [ -z "${fleet}" ]; then
-            echo "::error::no box is tagged RunnerLabel=${LABEL}; aws-dev-infra's provision.sh writes it" >&2
+            echo "::error::no box is tagged RunnerLabel=${LABEL}" >&2
             exit 1
           fi
           echo "${LABEL} fleet: ${fleet}"
@@ -302,8 +295,8 @@ jobs:
           # fleet never grows past the floor however much work is about to be
           # released.
           #
-          # Measured, not reasoned about: dps releases five `cpu` jobs per run,
-          # and this step reported `queued cpu jobs: 0`. The old three-caller
+          # Measured, not reasoned about: a caller released five `cpu` jobs in one
+          # run, and this step reported `queued cpu jobs: 0`. The old three-caller
           # layout hid it -- the overflow callers ran with `needs:` on the
           # primary, so by the time they counted, the jobs were real.
           #
@@ -431,7 +424,7 @@ jobs:
           want=$(( busy + need ))
           [ "${want}" -le "${size}" ] || want="${size}"
           if [ "${HAVE_CENSUS}" != "true" ]; then
-            echo "::notice::no runner census; sizing ${LABEL} from this repository's queue alone. Other repositories' load is invisible, so the fleet may be undersized (aws-dev-infra#55)."
+            echo "::notice::no runner census; sizing ${LABEL} from this repository's queue alone. Other repositories' load is invisible, so the fleet may be undersized."
           fi
           echo "${LABEL}: ${queued} queued here + ${busy} boxes busy elsewhere, ${per} per box -> want ${want} of ${size}"
           echo "want=${want}" >> "${GITHUB_OUTPUT}"
@@ -497,7 +490,7 @@ jobs:
             [ "${LADDER}" != "None" ] || LADDER=""
 
             # --output text prints a literal "None" for a tag that is not there
-            # -- a box provisioned before aws-dev-infra started writing it, or one
+            # -- a box provisioned before the tag was written, or one
             # from another stack. Treat that as "whatever it is now is what it
             # wants", which is exactly the behaviour this job had before the tag
             # existed.
@@ -507,8 +500,8 @@ jobs:
             if [ "${CURRENT}" != "${PREFERRED}" ]; then
               echo "::notice::${RUNNER_ID} is ${CURRENT} but is configured for ${PREFERRED}; a past capacity shortfall left it there. Trying ${PREFERRED} first."
             fi
-            # g6f.xlarge, a fractional L4 (2861 MiB), cannot build snarkVM-cuda's
-            # 3 GiB device pool (snarkVM-cuda#203). A box an older ladder left
+            # g6f.xlarge, a fractional L4 (2861 MiB), is too small for the CUDA
+            # suite's 3 GiB device pool. A box an older ladder left
             # there is moved off it, and never tried as itself below.
             if [ "${CURRENT}" = "g6f.xlarge" ]; then
               warn "this box is currently g6f.xlarge, a fractional L4 that cannot run the CUDA suite; retyping it to a full-size shape"

@@ -7,11 +7,6 @@
 # `unable to resolve action` -- and while it is live, anyone who can push that
 # branch runs code holding the caller's OIDC token.
 #
-# Also fails on any ref to aws-dev-infra or aws-cuda-dev, where this code lived
-# before. The trust policy stops admitting those paths once every caller has
-# moved, so a `uses:` missed by the sweep would otherwise keep passing here and
-# fail only at that point, in CI that nobody connects to the move.
-#
 # Runs in the caller's checkout: the files it reads are theirs. Matched from
 # `uses:` on, not the bare path, so a comment naming the path is not a ref.
 name: Check shared refs
@@ -35,12 +30,6 @@ runs:
         # org's would otherwise be held to this repo's pinning rule. Losing the
         # owner wildcard is safe because matching nothing is an error below.
         all=$(refs 'aleo-labs-protocol/gh-actions')
-        old=$(refs '[A-Za-z0-9._-]+/(aws-dev-infra|aws-cuda-dev)'; refs 'aleo-labs-flex/gh-actions')
-        if [ -n "${old}" ]; then
-          echo "::error::these moved to aleo-labs-protocol/gh-actions; repoint them:" >&2
-          printf '%s\n' "${old}" | sed 's/^/  /' >&2
-          exit 1
-        fi
         # Matching nothing is this check's own most likely failure, and it has
         # happened once: an org-keyed pattern went quiet when the repos moved.
         # A caller reaches this step through a `uses:` naming this repository,
