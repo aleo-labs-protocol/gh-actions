@@ -3,7 +3,7 @@
 The reusable workflow and composite actions that aleo-labs-protocol repositories
 use to start and run on the self-hosted runner fleet. The fleet itself — the
 boxes, their provisioning and the AWS role this workflow assumes — is managed
-in the private `aleo-labs-protocol/aws-dev-infra`.
+elsewhere.
 
 This repository is public so that public repositories can call it: GitHub does
 not let a public repository use actions from a private one. Nothing here is
@@ -11,8 +11,7 @@ secret. What decides who can start a box is the AWS role's trust policy, which
 admits named caller repositories only.
 
 ## Using it
-`gpu-test.yml` in snarkVM-cuda and dps both need a GPU runner started, and that
-logic was 128 identical lines in each before it was shared. It is published as a
+Several repositories start runners from CI. The logic is published once, as a
 reusable workflow plus composite actions, so a fix lands once.
 
 ```yaml
@@ -108,7 +107,7 @@ No thresholds in the caller: how deep a queue justifies another box is a
 property of the fleet, and it lives with the fleet. So is which boxes there are:
 the caller names only the label its jobs need, and the fleet is every box whose
 `RunnerLabel` tag is that label, each stepping down its own `CapacityLadder` tag
-when its AZ is short. aws-dev-infra's `provision.sh` writes both.
+when its AZ is short. Provisioning writes both.
 
 **The secret name has underscores on purpose.** GitHub secret names cannot contain
 hyphens, so a `runner-app-key` secret could never be supplied by `secrets: inherit`
@@ -127,13 +126,12 @@ Callers pin a major tag, currently `@v2`. The AWS role trusts `start-runner.yml`
 — not a branch, not a SHA — so a caller pinned any other way is denied at STS
 with "Not authorized to perform sts:AssumeRoleWithWebIdentity", which names
 neither the ref nor the claim. Every caller should run `check-shared-refs`: it
-fails on a ref that is not `@vN`, and on any ref to `aws-dev-infra`, where this
-code used to live.
+fails on a ref that is not `@vN`.
 
 That makes the org setting "Require actions to be pinned to a full-length commit
 SHA" incompatible with this repository: turned on, it rejects every caller's
-`@v2`, and a SHA pin is refused by the role. Change the trust policy in
-aws-dev-infra's `setup-oidc-role.sh` before turning it on.
+`@v2`, and a SHA pin is refused by the role. Change the role's trust policy
+before turning it on.
 
 A ruleset on all tags restricts creating, **updating** and deleting them to its
 bypass list. Moving a major tag is an update, and it changes what runs with

@@ -1,7 +1,7 @@
 # Numbers worth keeping from a job that ran on the GPU runner.
 #
 # Call with `if: always()` so a failed build still reports its disk and memory
-# state -- that is exactly when the numbers matter. See aws-dev-infra#3.
+# state -- that is exactly when the numbers matter.
 name: GPU runner report
 description: Append disk and GPU memory state to the job summary.
 
@@ -16,15 +16,14 @@ inputs:
       IT, since that is what the sampler measures. A peak at or above this would
       not fit on the deployment card whatever the runner happens to be.
 
-      NOT the number AWS reports. describe-instance-types says 45776 MiB for a
-      g6e.xlarge while nvidia-smi on that same box says 46068, and the offsets
+      NOT the number AWS reports. describe-instance-types says 45776 MiB for an
+      L40S box while nvidia-smi on that same box says 46068, and the offsets
       are not proportional -- so an AWS-derived constant compared against a
       sampled nvidia-smi value compares two different measurements.
 
-      The default is nvidia-smi's figure on a real L4 (g6.2xlarge, dps M-1056;
-      aws-dev-infra#6). The runner IS an L4 (`g6.4xlarge`), and start-runner.yml re-tries
-      that shape on every start, so a box sitting on g6e is a transient capacity
-      fallback rather than where it lives.
+      The default is nvidia-smi's figure on a real L4. The runner IS an L4, and
+      start-runner.yml re-tries that shape on every start, so a box sitting on an
+      L40S is a transient capacity fallback rather than where it lives.
     required: false
     default: '23034'
 

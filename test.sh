@@ -59,18 +59,6 @@ csr_fixture foreign <<'WF'
       - uses: someone-else/gh-actions/.github/actions/x@main
 WF
 ck "another org's gh-actions is not held to the pin" "$(csr_rc "$csr_tmp/foreign")" "0"
-# A `uses:` the move missed keeps working until the old path stops being
-# trusted, so it has to fail here, in the caller's PR -- pinned or not, and
-# whichever org or old name it was written with.
-csr_fixture old <<'WF'
-      - uses: aleo-labs-protocol/gh-actions/.github/actions/z@v1
-      - uses: aleo-labs-protocol/aws-dev-infra/.github/actions/x@v1
-      - uses: "otherorg/aws-cuda-dev/.github/actions/y@v1"
-      - uses: aleo-labs-flex/gh-actions/.github/actions/w@v1
-WF
-ck "a ref to where this code used to live fails" "$(csr_rc "$csr_tmp/old")" "1"
-ck "and names each one" \
-   "$(csr_out "$csr_tmp/old" | grep -cE '/(aws-dev-infra|aws-cuda-dev|gh-actions)/.github/actions/[xyw]@v1')" "3"
 csr_fixture none <<'WF'
       - uses: actions/checkout@v4
 WF
@@ -189,7 +177,7 @@ ck "and exactly divides without a spare" "$(plan 4 0)" "2"
 # The term that makes the sum right across repositories. Boxes busy with
 # another repo's work cannot take ours, so our queue needs capacity ON TOP of
 # them -- without this the second repository to arrive sees boxes already up and
-# starts nothing while its own jobs wait. aws-dev-infra#55.
+# starts nothing while its own jobs wait.
 ck "boxes busy elsewhere do not count as ours" "$(plan 3 2)" "3"
 ck "and the fleet is still the ceiling"        "$(plan 5 3)" "3"
 # The floor. A label nobody offers, a caller that forgot actions:read and a
@@ -209,13 +197,13 @@ ck "a queue it could not see still gets a box of its own" "$(plan '' 2)" "3"
 # job that never gets a box.
 ck "jobs-per-box below one does not divide by zero" "$(plan 5 0 0)" "3"
 ck "a one-box fleet is capped at one"    "$(plan 9 0 2 "cpu-runner")" "1"
-# The default in the units the fleet was sized in. dps queues five cpu jobs per
-# PR, and cpu-runner3 exists for the days two PRs are in flight -- not for every
-# PR, and not never, which is what queue-depth: 6 against a constant queue of
-# five amounted to.
+# The default in the units the fleet was sized in. The busiest caller queues
+# five cpu jobs per PR, and cpu-runner3 exists for the days two PRs are in
+# flight -- not for every PR, and not never, which is what queue-depth: 6
+# against a constant queue of five amounted to.
 jpb=$(sed -n '/^      jobs-per-box:/,/type: number/p' "$REPO/.github/workflows/start-runner.yml" | sed -n 's/^ *default: \(.*\)$/\1/p')
-ck "one dps PR (5 jobs) wakes two boxes"   "$(plan 5 0 "$jpb")" "2"
-ck "two dps PRs (10 jobs) wake the third"  "$(plan 10 0 "$jpb")" "3"
+ck "one busy PR (5 jobs) wakes two boxes"  "$(plan 5 0 "$jpb")" "2"
+ck "two busy PRs (10 jobs) wake the third" "$(plan 10 0 "$jpb")" "3"
 rm -rf "$fs_tmp"
 
 # The credential is optional: without it each repository sizes from its own
@@ -250,7 +238,7 @@ ck "it is hoisted to job-level env" \
    "$(grep -c 'HAS_RUNNER_APP_KEY: ' "$REPO/.github/workflows/start-runner.yml")" "1"
 
 echo "== shared workflow and actions are wired for other repos =="
-# These are consumed by snarkVM-cuda and dps. A rename or a dropped input breaks
+# These are consumed by other repositories. A rename or a dropped input breaks
 # their CI, not this repo's, so it is worth pinning here.
 WF="$REPO/.github/workflows/start-runner.yml"
 ck "reusable workflow exists" "$([[ -f "$WF" ]] && echo yes || echo no)" "yes"
@@ -435,7 +423,7 @@ chmod +x "$sc_tmp/bin/aws"
 # query: Name tag, id, type, state, PreferredInstanceType, and the stub adds
 # CapacityLadder. "None" is what it
 # really prints for a tag that is not there -- a box provisioned before
-# aws-dev-infra wrote that tag, which the chain still has to handle.
+# that tag was written, which the chain still has to handle.
 box() { printf '%s\ti-%s\t%s\t%s\t%s\n' "$1" "$1" "$2" "${3:-stopped}" "${4:-None}"; }
 
 fleet_start() { # runs the real step over whatever $sc_tmp/inv holds
@@ -472,7 +460,7 @@ ck "a start past the quota is skipped" \
 ck "g6 and g6e exhausted -> named error" \
    "$(start_chain g6.xlarge CAP,CAP)" \
    "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.xlarge g6e.xlarge)|::error::no box carrying gpu is online and none could be started; jobs needing it queue for 24h before GitHub gives up|"
-# A box an older ladder left on g6f cannot run the suite (snarkVM-cuda#203): it
+# A box an older ladder left on g6f cannot run the suite: it
 # is retyped off it, and g6f is never tried, tagged or not.
 ck "box already g6f: retyped to g6.xlarge" \
    "$(start_chain g6f.xlarge OK)" \
@@ -872,8 +860,8 @@ queue() { # -> the two count lines, then what it handed the plan step
 }
 # THIS run's jobs do not exist yet and will not until this workflow finishes:
 # they carry `needs:` on it, so GitHub has not created them. Counting the API
-# alone returns 0 for the caller that is asking, every time -- measured against
-# dps, which releases five cpu jobs and reported `queued cpu jobs: 0`. The old
+# alone returns 0 for the caller that is asking, every time -- measured on a
+# caller that released five cpu jobs and reported `queued cpu jobs: 0`. The old
 # three-caller layout hid it, because the overflow callers ran with `needs:` on
 # the primary and counted after the jobs were real.
 #

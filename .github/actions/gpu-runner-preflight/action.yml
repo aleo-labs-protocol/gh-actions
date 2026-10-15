@@ -1,10 +1,8 @@
 # Everything a job should do on the GPU runner BEFORE its own build starts.
 #
 # A composite action rather than part of the reusable workflow because these are
-# steps inside a job the caller owns: the test command differs per repository
-# (`-p snarkvm-algorithms --features cuda` versus `--workspace --features
-# dps/cuda,dps/test_consensus_heights`), so the job itself cannot be shared.
-# See aws-dev-infra#3.
+# steps inside a job the caller owns: the test command differs per repository,
+# so the job itself cannot be shared.
 name: GPU runner preflight
 description: Check disk headroom and report which GPU the job actually landed on.
 
@@ -93,7 +91,7 @@ runs:
         # L40S too and the warning would never fire on the exact case it exists
         # for.
         #
-        # A vGPU slice reports a PROFILE name -- "NVIDIA L4-3Q" on g6f.xlarge --
+        # A vGPU slice reports a PROFILE name -- "NVIDIA L4-3Q" --
         # which is the same silicon with less of it. That is its own case: the
         # plain warning below says the box may be MORE capable than the
         # deployment card (the L40S it was written for), and on a slice the
@@ -115,7 +113,7 @@ runs:
     # answers nothing. It is the whole question WHENEVER the box is not the card
     # we deploy on: an L40S carries roughly twice an L4's memory and a g6f slice
     # a fraction of it, so on either one "it passed" does not establish that it
-    # fits. On the configured g6.4xlarge the runner and the deployment card are
+    # fits. On a full L4 box the runner and the deployment card are
     # the same L4, and the headroom line is then comparing the box against
     # itself -- which is worth knowing when reading it, because it looks like
     # slack and is not.

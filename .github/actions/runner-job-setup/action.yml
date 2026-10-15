@@ -29,7 +29,7 @@ inputs:
       matrix job appends its axis, e.g. ci-<job id>-<arch>.
 
       Ignored where the box sets CI_TARGET_ROOT: on a one-slot box every job of
-      a repository shares one target dir (aws-dev-infra#48). Defaults to
+      a repository shares one target dir. Defaults to
       ci-<job id>, resolved in the step: an input default cannot read the
       github context, and neither can this text -- GitHub evaluates an
       expression anywhere in the file, a description included, and rejects
@@ -44,8 +44,7 @@ runs:
     #
     # CI_TARGET_ROOT is the box's: runner-install.sh sets it only where one slot
     # makes a shared dir safe, so every job of a repository builds in one target
-    # dir (aws-dev-infra#48, and its README "The target directory is part of the
-    # cache key"). Unset, it is a dir per job, as before.
+    # dir. Unset, it is a dir per job.
     - name: Target directory
       if: runner.environment == 'self-hosted'
       shell: bash
@@ -71,8 +70,8 @@ runs:
         echo "reusing ${target}"
 
     # These four arrive on the bottom rung of the precedence ladder, where any
-    # workflow- or job-level `env:` block silently overrode them (aws-dev-infra#58,
-    # and its README "What a workflow can override"); GITHUB_ENV is a rung up.
+    # workflow- or job-level `env:` block silently overrode them; GITHUB_ENV is
+    # a rung up.
     #
     # Read from the box's file, not this step's environment -- an override is
     # already in force here, so copying what we see would re-assert it. From
