@@ -1,0 +1,224 @@
+# Keeps one pull request open from each source branch into the target while the
+# source has commits the target lacks. Conflicts are committed with their
+# markers, labelled, and the pull request is a draft until people resolve them.
+#
+# Usage and setup: "Merging branches" in README.md.
+name: merge-branches
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: The branch that pull requests merge into.
+        type: string
+        required: true
+      sources:
+        description: Space-separated branches to merge into the target.
+        type: string
+        required: true
+    secrets:
+      # Lives in the caller's merge-bot environment. The caller passes it by
+      # name; the merge job, which sets that environment, receives its value.
+      # Not required: the caller's job has no environment, so the value it
+      # passes is empty. A missing key fails the app-token step instead.
+      MERGE_BOT_APP_KEY:
+        required: false
+
+permissions: {}
+
+env:
+  REPO: ${{ github.repository }}
+  TARGET: ${{ inputs.target }}
+  SOURCES: ${{ inputs.sources }}
+
+jobs:
+  # Runs without the merge-bot environment, so a run with nothing to merge
+  # never loads the app key.
+  check:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: read }
+    outputs:
+      sources: ${{ steps.check.outputs.sources }}
+    steps:
+      - name: Find the sources with commits to merge
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pending=()
+          for src in $SOURCES; do
+            if [ "$src" = "$TARGET" ]; then
+              echo "::error::$src is both a source and the target" >&2
+              exit 1
+            fi
+            head="ci/merge-$src-into-$TARGET"
+            ahead=$(gh api "repos/$REPO/compare/$TARGET...$src" --jq .ahead_by)
+            if [ "$ahead" = 0 ]; then
+              echo "$src: nothing to merge"
+              continue
+            fi
+            open=$(gh pr list -R "$REPO" --head "$head" --base "$TARGET" --state open --json number --jq length)
+            if [ "$open" != 0 ] && [ "$(gh api "repos/$REPO/compare/$src...$head" --jq .behind_by)" = 0 ]; then
+              echo "$src: the open pull request already carries $src"
+              continue
+            fi
+            echo "$src: $ahead commit(s) to merge"
+            pending+=("$src")
+          done
+          echo "sources=$(jq -cn '$ARGS.positional' --args "${pending[@]}")" >> "$GITHUB_OUTPUT"
+
+  merge:
+    needs: check
+    if: needs.check.outputs.sources != '[]'
+    name: Merge ${{ matrix.source }} into ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    # The caller's environment, which admits only runs on the target branch, so
+    # a workflow on any other branch cannot read the app key.
+    environment: merge-bot
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.check.outputs.sources) }}
+    env:
+      SOURCE: ${{ matrix.source }}
+      LABEL: merge-conflict
+    steps:
+      # Pushes and pull requests made with github.token start no workflows, so
+      # CI would never run on the pull request. `workflows: write` lets the
+      # merge commit carry changes to .github/workflows.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target }}
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Merge and open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          git config user.name "$bot"
+          git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
+
+          head="ci/merge-$SOURCE-into-$TARGET"
+          src=$(git rev-parse "origin/$SOURCE")
+          pr=$(gh pr list --head "$head" --base "$TARGET" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            # Builds on the branch as people left it, so a pushed conflict
+            # resolution is never overwritten.
+            base=$head
+            force=()
+          else
+            # With no open pull request, a branch left by a closed one is replaced.
+            base=$TARGET
+            force=(--force)
+          fi
+          git checkout -B "$head" "origin/$base"
+          if git merge-base --is-ancestor "$src" HEAD; then
+            echo "$head already contains $SOURCE"
+            exit 0
+          fi
+          new_commits=$(git rev-list "HEAD..$src")
+
+          # A modify/delete, rename or binary conflict leaves no markers, and
+          # `git add -A` then keeps one side silently, so the unmerged paths are
+          # recorded before staging.
+          subject="Merge $SOURCE into $TARGET"
+          conflicts=()
+          if ! git merge --no-ff --no-edit -m "$subject" "$src"; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if [ "${#conflicts[@]}" = 0 ]; then
+              echo "::error::git merge failed without reporting a conflict" >&2
+              exit 1
+            fi
+            git add -A
+            git commit --no-verify -F - <<EOF
+          $subject
+
+          Committed with these paths unresolved:
+          $(printf '    %s\n' "${conflicts[@]}")
+          EOF
+            # Gated before the push: once the branch carries the source, the
+            # next run has nothing to redo.
+            gh label create "$LABEL" --force --color B60205 --description "Committed with unresolved merge conflicts"
+            if [ -n "$pr" ]; then
+              gh pr edit "$pr" --add-label "$LABEL"
+              gh pr ready "$pr" --undo
+            fi
+          fi
+
+          git push "${force[@]}" origin "HEAD:refs/heads/$head"
+
+          count=$(wc -l <<< "$new_commits")
+          summary="Merges $count new commit(s) from \`$SOURCE\` at ${src:0:9}."
+          if [ "${#conflicts[@]}" != 0 ]; then
+            summary="$summary
+
+          > [!WARNING]
+          > The merge has conflicts. They are committed as git left them, and this pull request is a draft until they are resolved. A delete or binary conflict has no markers, so check every file listed:
+          >
+          $(printf "> - \`%s\`\n" "${conflicts[@]}")
+          >
+          > To resolve, check out \`$head\`, fix these files, and push the fix as its own commit. Then remove the \`$LABEL\` label and mark the pull request ready for review."
+          fi
+
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "$summary"
+          else
+            body="Merges \`$SOURCE\` into \`$TARGET\`. Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow.
+
+          $summary
+
+          Changes on \`$SOURCE\`: $GITHUB_SERVER_URL/$REPO/compare/$TARGET...$SOURCE
+
+          Review is requested from the authors and reviewers of the pull requests these commits came from. When \`$SOURCE\` moves, the workflow merges it into this branch again and never force-pushes, so a resolution pushed here is kept."
+            args=(--head "$head" --base "$TARGET" --title "$subject" --body "$body")
+            if [ "${#conflicts[@]}" != 0 ]; then
+              args+=(--draft --label "$LABEL")
+            fi
+            pr=$(gh pr create "${args[@]}" | sed 's|.*/||')
+          fi
+
+          # Authors and reviewers of the merged pull requests behind the new
+          # commits, or the commit author where a commit has no pull request.
+          # Lookups are best effort. On failure `gh api` prints the error body
+          # to stdout, so `lookup` drops it.
+          lookup() {
+            local out
+            if out=$(gh api "$@"); then
+              printf '%s\n' "$out"
+            else
+              echo "::warning::lookup failed: gh api $*" >&2
+            fi
+          }
+          prs=()
+          reviewers=()
+          for sha in $new_commits; do
+            mapfile -t merged < <(lookup "repos/$REPO/commits/$sha/pulls" --jq '.[] | select(.merged_at != null) | "\(.number) \(.user.login)"')
+            if [ "${#merged[@]}" = 0 ]; then
+              reviewers+=("$(lookup "repos/$REPO/commits/$sha" --jq '.author.login // empty')")
+            fi
+            prs+=("${merged[@]}")
+          done
+          while read -r n author; do
+            reviewers+=("$author")
+            mapfile -t -O "${#reviewers[@]}" reviewers < <(lookup --paginate "repos/$REPO/pulls/$n/reviews" --jq '.[].user.login')
+          done < <(printf '%s\n' "${prs[@]}" | sort -u | grep .)
+          for login in $(printf '%s\n' "${reviewers[@]}" | grep -v -e '^$' -e '\[bot\]$' | sort -u); do
+            gh api "repos/$REPO/pulls/$pr/requested_reviewers" -f "reviewers[]=$login" --silent \
+              || echo "::warning::could not request review from $login"
+          done

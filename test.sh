@@ -78,12 +78,13 @@ ck "the README documents one repository, not two" \
       | LC_ALL=C sort -u | tr '\n' ' ')" "gh-actions "
 
 
-echo "== what runs holding the role is pinned =="
+echo "== what runs holding the role or an app key is pinned =="
 # The trust policy names start-runner.yml at a tag, not what it pulls in, so an
 # action it uses by tag is trusted to whoever can move that tag. A SHA cannot be
-# moved; dependabot.yml keeps the pins current.
+# moved; dependabot.yml keeps the pins current. merge-branches.yml holds the
+# merge-bot app key, so the same goes for it.
 ck "every action the workflow and actions use is pinned to a SHA" \
-   "$(grep -rhoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' "$REPO/.github/workflows/start-runner.yml" "$REPO/.github/actions" \
+   "$(grep -rhoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' "$REPO/.github/workflows/start-runner.yml" "$REPO/.github/workflows/merge-branches.yml" "$REPO/.github/actions" \
       | sed -E 's/.*uses:[[:space:]]*//' | grep -vE '@[0-9a-f]{40}$' | tr '\n' ' ')" ""
 
 echo "== fleet sizing: this repo's queue, plus the boxes busy elsewhere =="
@@ -998,6 +999,176 @@ SMI_OUT="NVIDIA-SMI has failed" SMI_RC=9 EXPECTED_GPU=L4 \
   GITHUB_STEP_SUMMARY="$pf_tmp/summary" PATH="$pf_tmp/bin:$PATH" \
   bash "$pf_tmp/gpu.sh" >/dev/null 2>&1
 ck "driver failure still fails the step" "$?" "9"
+
+echo "== merge-branches: which sources need a run =="
+mb_tmp="$(mktemp -d)"; mkdir -p "$mb_tmp/bin-check" "$mb_tmp/bin"
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/workflows/merge-branches.yml'))
+st = {x.get('name'): x for j in d['jobs'].values() for x in j['steps'] if x.get('name')}
+open('$mb_tmp/check.sh', 'w').write(st['Find the sources with commits to merge']['run'])
+open('$mb_tmp/merge.sh', 'w').write(st['Merge and open or update the pull request']['run'])
+"
+# AHEAD_<src> is how far the source is ahead of the target, OPEN_<src> how many
+# pull requests are open for it, BEHIND_<src> how far that pull request's
+# branch is behind the source.
+cat > "$mb_tmp/bin-check/gh" <<'GHEOF'
+#!/bin/bash
+case "$*" in
+  *"compare/$TARGET..."*) v="AHEAD_${2##*...}"; echo "${!v}";;
+  *"pr list"*) h="$*"; h="${h#*--head ci/merge-}"; v="OPEN_${h%%-into-*}"; echo "${!v:-0}";;
+  *compare/*) s="${2#*compare/}"; v="BEHIND_${s%%...*}"; echo "${!v}";;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$mb_tmp/bin-check/gh"
+mb_check() { # env assignments -> the sources output, or "rc=N" if the step failed
+  : > "$mb_tmp/out"
+  if env "$@" PATH="$mb_tmp/bin-check:$PATH" REPO=o/r TARGET=staging GITHUB_OUTPUT="$mb_tmp/out" \
+       bash "$mb_tmp/check.sh" >/dev/null 2>&1; then
+    sed -n 's/^sources=//p' "$mb_tmp/out"
+  else
+    echo "rc=$?"
+  fi
+}
+ck "nothing ahead, nothing to run" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=0 AHEAD_mainnet=0)" '[]'
+ck "ahead with no pull request" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=3 AHEAD_mainnet=0)" '["testnet"]'
+ck "an open pull request carries it" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=3 OPEN_testnet=1 BEHIND_testnet=0)" '[]'
+ck "the source moved past it" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=4 OPEN_testnet=1 BEHIND_testnet=1)" '["testnet"]'
+ck "both sources, in order" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=1 AHEAD_mainnet=2)" '["testnet","mainnet"]'
+ck "a source that is the target fails" \
+   "$(mb_check SOURCES='staging' AHEAD_staging=0)" 'rc=1'
+
+echo "== merge-branches: merging, conflicts and reviewers =="
+# A real git remote, so the merge, the push and what the branch ends up holding
+# are git's own answers. Commit subjects stand in for the API: `pr:N:login` is
+# a commit from merged pull request N by login, `direct:login` one with none.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$mb_tmp/gitconfig"
+git config -f "$GIT_CONFIG_GLOBAL" user.name test
+git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
+git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch staging
+git config -f "$GIT_CONFIG_GLOBAL" advice.detachedHead false
+git init -q --bare "$mb_tmp/origin.git"
+# Logs pushes into the same log as the gh stub, so their order is checked.
+printf '#!/bin/sh\necho push >> %q\n' "$mb_tmp/log" > "$mb_tmp/origin.git/hooks/pre-receive"
+chmod +x "$mb_tmp/origin.git/hooks/pre-receive"
+cat > "$mb_tmp/bin/gh" <<GHEOF
+#!/bin/bash
+LOG=$(printf %q "$mb_tmp/log")
+GHEOF
+cat >> "$mb_tmp/bin/gh" <<'GHEOF'
+args="$*"
+lookup_fail() { [ -n "${MB_LOOKUP_FAIL:-}" ] && { echo '{"message":"Bad credentials"}'; exit 1; }; }
+case "$*" in
+  "pr list"*) cat "${MB_PR_FILE}";;
+  "api users/"*) echo 12345;;
+  *"/commits/"*"/pulls "*) lookup_fail; s=${args#*/commits/}; s=$(git log -1 --format=%s "${s%%/*}")
+    [[ $s == pr:* ]] && { s=${s#pr:}; echo "${s%%:*} ${s#*:}"; };;
+  *"/commits/"*) lookup_fail; s=${args#*/commits/}; s=$(git log -1 --format=%s "${s%% *}")
+    [[ $s == direct:* ]] && echo "${s#direct:}";;
+  *"/pulls/7/reviews"*) lookup_fail; printf 'bob\nalice\nrenovate[bot]\n';;
+  *"/reviews"*) lookup_fail; echo frank;;
+  *requested_reviewers*|"label create"*|"pr comment"*|"pr edit"*|"pr ready"*) echo "gh $*" >> "$LOG";;
+  "pr create"*) echo "gh $*" >> "$LOG"; echo https://github.com/o/r/pull/42;;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$mb_tmp/bin/gh"
+
+git init -q "$mb_tmp/seed"
+mb_git() { git -C "$mb_tmp/seed" "$@"; }
+mb_commit() { # branch subject file content ("-" deletes the file)
+  mb_git checkout -q "$1"
+  if [ "$4" = - ]; then mb_git rm -q "$3"; else echo "$4" > "$mb_tmp/seed/$3"; mb_git add "$3"; fi
+  mb_git commit -q -m "$2"
+  mb_git push -q origin "$1"
+}
+mb_git remote add origin "$mb_tmp/origin.git"
+echo 1 > "$mb_tmp/seed/a"; echo 1 > "$mb_tmp/seed/c"
+mb_git add a c; mb_git commit -q -m base
+mb_git branch testnet; mb_git branch mainnet
+mb_git push -q origin staging testnet mainnet
+mb_commit staging "staging edits c" c 2
+mb_commit testnet "pr:7:alice" a 2
+mb_commit testnet "direct:carol" b 1
+mb_commit mainnet "pr:9:dave" c -
+
+mb_run() { # source  open-pr-number-or-empty -> the step's exit code
+  rm -rf "$mb_tmp/work"
+  git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
+  echo "$2" > "$mb_tmp/pr"
+  : > "$mb_tmp/log"
+  ( cd "$mb_tmp/work" || exit 99
+    PATH="$mb_tmp/bin:$PATH" MB_PR_FILE="$mb_tmp/pr" GH_TOKEN=x APP_SLUG=merge-bot REPO=o/r \
+      TARGET=staging SOURCE="$1" LABEL=merge-conflict \
+      GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=1 GITHUB_WORKFLOW=w \
+      bash "$mb_tmp/merge.sh" ) > "$mb_tmp/out" 2>&1
+  echo "$?"
+}
+mb_order() { grep -oE '^(push|gh (label create|pr create|pr edit|pr ready|pr comment))' "$mb_tmp/log" | tr '\n' '|'; }
+mb_reviewers() { sed -n 's/.*reviewers\[\]=\([^ ]*\).*/\1/p' "$mb_tmp/log" | tr '\n' ' '; }
+mb_tip() { git -C "$mb_tmp/origin.git" rev-parse "refs/heads/ci/merge-$1-into-staging"; }
+mb_has() { git -C "$mb_tmp/origin.git" merge-base --is-ancestor "$2" "$(mb_tip "$1")"; echo "$?"; }
+# A person pushing to the bot's branch: checks it out, changes a file, pushes.
+mb_human() { # source file content -> the pushed commit
+  mb_git fetch -q origin
+  mb_git checkout -q -B human "origin/ci/merge-$1-into-staging"
+  if [ "$3" = - ]; then mb_git rm -q "$2"; else echo "$3" > "$mb_tmp/seed/$2"; mb_git add "$2"; fi
+  mb_git commit -q -m "resolve $2"
+  mb_git push -q origin "human:ci/merge-$1-into-staging"
+  mb_git rev-parse HEAD
+}
+
+ck "clean: the step succeeds"          "$(mb_run testnet '')" "0"
+ck "clean: pushes, then opens"         "$(mb_order)" "push|gh pr create|"
+ck "clean: not a draft"                "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+ck "clean: the branch holds testnet"   "$(mb_has testnet "$(mb_git rev-parse testnet)")" "0"
+# alice wrote #7 and reviewed it too, renovate[bot] is not a person, and carol's
+# commit has no pull request.
+ck "clean: authors and reviewers"      "$(mb_reviewers)" "alice bob carol "
+
+ck "rerun: the step succeeds"          "$(mb_run testnet 42)" "0"
+ck "rerun: does nothing"               "$(cat "$mb_tmp/log")" ""
+
+# mainnet deletes c, which staging edited: a conflict that leaves no markers.
+ck "conflict: the step succeeds"       "$(mb_run mainnet '')" "0"
+ck "conflict: labels before the push"  "$(mb_order)" "gh label create|push|gh pr create|"
+ck "conflict: opened as a draft"       "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+ck "conflict: the commit names c" \
+   "$(git -C "$mb_tmp/origin.git" log -1 --format=%B "$(mb_tip mainnet)" | grep -c '^    c$')" "1"
+ck "conflict: author and reviewer"     "$(mb_reviewers)" "dave frank "
+
+resolved=$(mb_human mainnet c -)
+mb_commit mainnet "pr:11:erin" d 1
+ck "update: the step succeeds"         "$(mb_run mainnet 43)" "0"
+ck "update: pushes, then comments"     "$(mb_order)" "push|gh pr comment|"
+ck "update: keeps the resolution"      "$(mb_has mainnet "$resolved")" "0"
+ck "update: carries the new commit"    "$(mb_has mainnet "$(mb_git rev-parse mainnet)")" "0"
+
+# Someone edited a on the open pull request's branch; testnet now edits a too.
+mine=$(mb_human testnet a human)
+mb_commit testnet "pr:12:gina" a 3
+ck "new conflict: the step succeeds"   "$(mb_run testnet 42)" "0"
+ck "new conflict: gated, then pushed" \
+   "$(mb_order)" "gh label create|gh pr edit|gh pr ready|push|gh pr comment|"
+ck "new conflict: back to draft"       "$(grep -c 'pr ready 42 --undo' "$mb_tmp/log")" "1"
+ck "new conflict: keeps their commit"  "$(mb_has testnet "$mine")" "0"
+
+# The pull request was closed, so the branch is rebuilt from staging, and the
+# API refuses every lookup.
+ck "lookups fail: the step succeeds" \
+   "$(MB_LOOKUP_FAIL=1 mb_run testnet '')" "0"
+ck "lookups fail: no review requested" "$(mb_reviewers)" ""
+# Three new commits, none with a pull request found, so two lookups each.
+ck "lookups fail: warned"              "$(grep -c '::warning::lookup failed' "$mb_tmp/out")" "6"
+ck "closed: the old branch is replaced" "$(mb_has testnet "$mine")" "1"
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+rm -rf "$mb_tmp"
 
 rm -rf "$no_aws"
 echo
