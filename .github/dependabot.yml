@@ -1,5 +1,5 @@
-# The actions start-runner.yml uses are pinned to commit SHAs, because they run
-# holding the AWS role; this is what keeps those pins current.
+# The actions the shared workflows use are pinned to commit SHAs, because they
+# run with their callers' credentials; this is what keeps those pins current.
 version: 2
 updates:
   - package-ecosystem: github-actions

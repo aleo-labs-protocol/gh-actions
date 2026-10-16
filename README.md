@@ -1,8 +1,9 @@
 # gh-actions
 
-The reusable workflow and composite actions that aleo-labs-protocol repositories
-use to start and run on the self-hosted runner fleet. The fleet itself — the
-boxes, their provisioning and the AWS role this workflow assumes — is managed
+The reusable workflows and composite actions that aleo-labs-protocol
+repositories share: starting and running on the self-hosted runner fleet, and
+merging branches forward (`merge-branches.yml`). The fleet itself — the boxes,
+their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
 
 This repository is public so that public repositories can call it: GitHub does
@@ -132,6 +133,9 @@ target branch while the source has commits the target lacks.
   `merge-conflict` label and is a draft until people push a resolution.
 - When the source moves, the next run merges it into the open pull request's
   branch. It never force-pushes that branch, so a resolution is kept.
+- The target must merge these pull requests with a merge commit. A squash or
+  rebase leaves the source's commits off the target, so the next run opens
+  the same pull request again.
 
 The caller owns the schedule and the concurrency group, and grants the check
 job its permissions:

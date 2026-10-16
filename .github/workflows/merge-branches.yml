@@ -46,18 +46,30 @@ jobs:
         run: |
           set -euo pipefail
           pending=()
+          failed=0
           for src in $SOURCES; do
             if [ "$src" = "$TARGET" ]; then
               echo "::error::$src is both a source and the target" >&2
               exit 1
             fi
             head="ci/merge-$src-into-$TARGET"
-            ahead=$(gh api "repos/$REPO/compare/$TARGET...$src" --jq .ahead_by)
+            # A failed lookup skips only this source; the run still fails.
+            if ! ahead=$(gh api "repos/$REPO/compare/$TARGET...$src" --jq .ahead_by); then
+              echo "::error::could not compare $src with $TARGET" >&2
+              failed=1
+              continue
+            fi
             if [ "$ahead" = 0 ]; then
               echo "$src: nothing to merge"
               continue
             fi
-            open=$(gh pr list -R "$REPO" --head "$head" --base "$TARGET" --state open --json number --jq length)
+            # --head matches a fork's branch of the same name too.
+            if ! open=$(gh pr list -R "$REPO" --head "$head" --base "$TARGET" --state open \
+                          --json isCrossRepository --jq 'map(select(.isCrossRepository | not)) | length'); then
+              echo "::error::could not list pull requests from $head" >&2
+              failed=1
+              continue
+            fi
             if [ "$open" != 0 ] && [ "$(gh api "repos/$REPO/compare/$head...$src" --jq .ahead_by)" = 0 ]; then
               echo "$src: the open pull request already carries $src"
               continue
@@ -66,10 +78,12 @@ jobs:
             pending+=("$src $head")
           done
           echo "pending=$(jq -cn '[$ARGS.positional[] | split(" ") | {source: .[0], branch: .[1]}]' --args "${pending[@]}")" >> "$GITHUB_OUTPUT"
+          exit "$failed"
 
   merge:
     needs: check
-    if: needs.check.outputs.pending != '[]'
+    # Runs for the sources the check job could answer, even if another failed.
+    if: ${{ !cancelled() && needs.check.outputs.pending != '' && needs.check.outputs.pending != '[]' }}
     name: Merge ${{ matrix.source }} into ${{ inputs.target }}
     runs-on: ubuntu-latest
     # The caller's environment, which admits only runs on the target branch, so
@@ -115,26 +129,26 @@ jobs:
 
           label=merge-conflict
           src=$(git rev-parse "origin/$SOURCE")
-          pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number --jq '.[0].number // empty')
+          # --head matches a fork's branch of the same name too.
+          pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
+                 --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
           if [ -n "$pr" ]; then
             # Builds on the branch as people left it, so a pushed conflict
             # resolution is never overwritten.
             base=$BRANCH
             force=()
           else
-            # With no open pull request, a branch left by a closed one is replaced.
+            # With no open pull request, a branch left by a closed one is
+            # replaced, unless someone pushed to it after this run fetched it.
             base=$TARGET
-            force=(--force)
+            force=(--force-with-lease="refs/heads/$BRANCH:$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH" || true)")
           fi
           git checkout -B "$BRANCH" "origin/$base"
           if git merge-base --is-ancestor "$src" HEAD; then
             echo "$BRANCH already contains $SOURCE"
             exit 0
           fi
-          count=$(git rev-list --count "HEAD..$src")
-          # A pull request's merge commit names it, so the first-parent commits
-          # are enough to find every pull request.
-          lookups=$(git rev-list --first-parent "HEAD..$src")
+          new_commits=$(git rev-list "HEAD..$src")
 
           # A modify/delete, rename or binary conflict leaves no markers, and
           # `git add -A` then keeps one side silently, so the unmerged paths are
@@ -175,7 +189,7 @@ jobs:
 
           git push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
 
-          summary="Merges $count new commit(s) from \`$SOURCE\` at ${src:0:9}.$warning"
+          summary="Merges $(wc -l <<< "$new_commits") new commit(s) from \`$SOURCE\` at ${src:0:9}.$warning"
           if [ -n "$pr" ]; then
             gh pr comment "$pr" --body "$summary"
           else
@@ -202,7 +216,7 @@ jobs:
             fi
           }
           logins=$(
-            for sha in $lookups; do
+            for sha in $new_commits; do
               lookup "repos/$REPO/commits/$sha/pulls" --jq '.[] | select(.merged_at != null) | "\(.number) \(.user.login)"' | grep . \
                 || lookup "repos/$REPO/commits/$sha" --jq '.author.login // empty'
             done | sort -u | while read -r n author; do
@@ -212,10 +226,16 @@ jobs:
                 continue
               fi
               echo "$author"
-              lookup --paginate "repos/$REPO/pulls/$n/reviews" --jq '.[].user.login'
+              lookup --paginate "repos/$REPO/pulls/$n/reviews" --jq '.[].user.login' | sort -u
             done
           )
-          sed -e '/^$/d' -e '/\[bot\]$/d' <<< "$logins" | sort -u | while read -r login; do
+          # Most pull requests first, and at most `max` people.
+          max=15
+          mapfile -t ranked < <(sed -e '/^$/d' -e '/\[bot\]$/d' <<< "$logins" | sort | uniq -c | sort -k1,1nr -k2,2 | awk '{print $2}')
+          if [ "${#ranked[@]}" -gt "$max" ]; then
+            echo "::warning::requesting review from $max of ${#ranked[@]} people"
+          fi
+          for login in "${ranked[@]:0:$max}"; do
             gh api "repos/$REPO/pulls/$pr/requested_reviewers" -f "reviewers[]=$login" --silent \
               || echo "::warning::could not request review from $login"
           done
