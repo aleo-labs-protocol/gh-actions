@@ -1,8 +1,9 @@
 # gh-actions
 
-The reusable workflow and composite actions that aleo-labs-protocol repositories
-use to start and run on the self-hosted runner fleet. The fleet itself — the
-boxes, their provisioning and the AWS role this workflow assumes — is managed
+The reusable workflows and composite actions that aleo-labs-protocol
+repositories share: starting and running on the self-hosted runner fleet, and
+merging branches forward (`merge-branches.yml`). The fleet itself — the boxes,
+their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
 
 This repository is public so that public repositories can call it: GitHub does
@@ -120,6 +121,73 @@ match, an app installed elsewhere, a rate-limited listing. Each falls back to
 under-provisions rather than over-provisions, and a run is never reddened by a
 count it could not take.
 
+## Merging branches
+
+`merge-branches.yml` keeps one pull request open from each source branch into a
+target branch while the source has commits the target lacks.
+
+- The pull request comes from `ci/merge-<source>-into-<target>`. Review is
+  requested from the authors and reviewers of the merged pull requests behind
+  the new commits.
+- A conflict is committed with its markers. The pull request gets the
+  `merge-conflict` label and is a draft until people push a resolution.
+- When the source moves, the next run merges it into the open pull request's
+  branch. It never force-pushes that branch, so a resolution is kept.
+- The target must merge these pull requests with a merge commit. A squash or
+  rebase leaves the source's commits off the target, so the next run opens
+  the same pull request again.
+
+The caller owns the schedule and the concurrency group, and grants the check
+job its permissions:
+
+```yaml
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: merge-into-staging
+
+jobs:
+  merge:
+    uses: aleo-labs-protocol/gh-actions/.github/workflows/merge-branches.yml@v2
+    permissions: { contents: read, pull-requests: read }
+    with:
+      target: staging
+      sources: testnet mainnet
+    secrets:
+      MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
+```
+
+**It pushes as a GitHub App**, because a push made with `github.token` starts no
+workflows. The App is the single-purpose **aleo-labs merge-bot**, for the reason
+given under [Giving a caller the fleet-wide view](#giving-a-caller-the-fleet-wide-view).
+It holds contents, pull requests, issues and workflows write, and nothing else.
+Install it on the calling repository.
+
+Its key lives in an environment named **`merge-bot`** in the calling
+repository, whose deployment branches admit only the target branch:
+
+```sh
+gh secret   set MERGE_BOT_APP_KEY   --env merge-bot -R <repo> < path/to/key.pem
+gh variable set MERGE_BOT_CLIENT_ID --env merge-bot -R <repo> --body <client id>
+```
+
+The merge job sets that environment itself, because a calling job cannot. The
+caller still passes the secret by name, as above. Its own job has no
+environment, so the value it passes is empty, and the merge job receives the
+environment's value instead.
+
+The App can push changes to `.github/workflows`, so a leaked key could push a
+branch whose workflow reads **repository** secrets. Keep sensitive secrets in
+environments that admit only protected branches.
+
+A bot push to a pull request keeps approvals given before it, unless the
+target's rules dismiss stale approvals or require approval of the most recent
+push.
+
 ## Versioning
 
 Callers pin a major tag, currently `@v2`. The AWS role trusts `start-runner.yml` **only at a `v*` tag**
@@ -145,9 +213,9 @@ a caller branch points at that tag, and the tag is deleted afterwards. The
 ruleset covers it like any other `v*`, and `check-shared-refs` fails on it, so it
 cannot be merged by accident.
 
-The actions `start-runner.yml` uses run holding the role, and the trust policy
-names this file, not what it pulls in, so they are pinned to commit SHAs;
-Dependabot proposes the updates.
+The actions the shared workflows use run with their callers' credentials: the
+fleet's AWS role, an App key. A caller pins this repository, not what it pulls
+in, so they are pinned to commit SHAs; Dependabot proposes the updates.
 
 ## Development
 

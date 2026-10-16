@@ -78,12 +78,15 @@ ck "the README documents one repository, not two" \
       | LC_ALL=C sort -u | tr '\n' ' ')" "gh-actions "
 
 
-echo "== what runs holding the role is pinned =="
-# The trust policy names start-runner.yml at a tag, not what it pulls in, so an
-# action it uses by tag is trusted to whoever can move that tag. A SHA cannot be
-# moved; dependabot.yml keeps the pins current.
-ck "every action the workflow and actions use is pinned to a SHA" \
-   "$(grep -rhoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' "$REPO/.github/workflows/start-runner.yml" "$REPO/.github/actions" \
+echo "== what callers run is pinned =="
+# A shared workflow or action runs with its caller's credentials: the fleet's
+# AWS role, an App key. A caller pins this repository at a tag, not what it
+# pulls in, so an action used by tag is trusted to whoever can move that tag. A
+# SHA cannot be moved; dependabot.yml keeps the pins current. ci.yml is this
+# repository's own CI, which no caller runs.
+ck "every action the workflows and actions use is pinned to a SHA" \
+   "$(find "$REPO/.github/workflows" "$REPO/.github/actions" \( -name '*.yml' -o -name '*.yaml' \) ! -path '*/workflows/ci.yml' -print0 \
+      | xargs -0 grep -hoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' \
       | sed -E 's/.*uses:[[:space:]]*//' | grep -vE '@[0-9a-f]{40}$' | tr '\n' ' ')" ""
 
 echo "== fleet sizing: this repo's queue, plus the boxes busy elsewhere =="
@@ -998,6 +1001,227 @@ SMI_OUT="NVIDIA-SMI has failed" SMI_RC=9 EXPECTED_GPU=L4 \
   GITHUB_STEP_SUMMARY="$pf_tmp/summary" PATH="$pf_tmp/bin:$PATH" \
   bash "$pf_tmp/gpu.sh" >/dev/null 2>&1
 ck "driver failure still fails the step" "$?" "9"
+
+echo "== merge-branches: which sources need a run =="
+mb_tmp="$(mktemp -d)"; mkdir -p "$mb_tmp/bin-check" "$mb_tmp/bin"
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/workflows/merge-branches.yml'))
+st = {x.get('name'): x for j in d['jobs'].values() for x in j['steps'] if x.get('name')}
+open('$mb_tmp/check.sh', 'w').write(st['Find the sources with commits to merge']['run'])
+open('$mb_tmp/merge.sh', 'w').write(st['Merge and open or update the pull request']['run'])
+"
+# Both stubs answer `pr list` with JSON run through the step's own --jq, so the
+# step's filtering is what is tested.
+cat > "$mb_tmp/jq_arg" <<'JQEOF'
+jq_arg() { local prev=; for a in "$@"; do [ "$prev" = --jq ] && { echo "$a"; return; }; prev=$a; done; }
+JQEOF
+# AHEAD_<src> is how far the source is ahead of the target ("fail" fails the
+# call), OPEN_<src> and FORK_<src> how many pull requests from this repository
+# and from forks are open from its branch, MISSING_<src> how many of the
+# source's commits that branch lacks.
+cat > "$mb_tmp/bin-check/gh" <<'GHEOF'
+#!/bin/bash
+. "$MB_JQ_ARG"
+case "$*" in
+  *"compare/$TARGET..."*) v="AHEAD_${2##*...}"
+    [ "${!v}" = fail ] && { echo '{"message":"Not Found"}'; exit 1; }
+    echo "${!v}";;
+  *"pr list"*) h="$*"; h="${h#*--head ci/merge-}"; o="OPEN_${h%%-into-*}"; f="FORK_${h%%-into-*}"
+    jq -n --argjson o "${!o:-0}" --argjson f "${!f:-0}" \
+      '[range($f) | {isCrossRepository: true}] + [range($o) | {isCrossRepository: false}]' \
+      | jq -r "$(jq_arg "$@")";;
+  *compare/ci/merge-*) s="${2#*compare/ci/merge-}"; v="MISSING_${s%%-into-*}"; echo "${!v}";;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$mb_tmp/bin-check/gh"
+mb_check() { # env assignments -> the pending sources, then " rc=N" if the step failed
+  : > "$mb_tmp/out"
+  env "$@" PATH="$mb_tmp/bin-check:$PATH" MB_JQ_ARG="$mb_tmp/jq_arg" REPO=o/r TARGET=staging \
+    GITHUB_OUTPUT="$mb_tmp/out" bash "$mb_tmp/check.sh" >/dev/null 2>&1
+  local rc=$?
+  printf '%s' "$(sed -n 's/^pending=//p' "$mb_tmp/out" | jq -c '[.[].source]')"
+  [ "$rc" = 0 ] || printf ' rc=%s' "$rc"
+}
+ck "nothing ahead, nothing to run" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=0 AHEAD_mainnet=0)" '[]'
+ck "ahead with no pull request" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=3 AHEAD_mainnet=0)" '["testnet"]'
+ck "an open pull request carries it" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=3 OPEN_testnet=1 MISSING_testnet=0)" '[]'
+ck "the source moved past it" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=4 OPEN_testnet=1 MISSING_testnet=1)" '["testnet"]'
+ck "both sources, in order" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=1 AHEAD_mainnet=2)" '["testnet","mainnet"]'
+ck "each names the branch it merges into" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=1 >/dev/null; sed -n 's/^pending=//p' "$mb_tmp/out")" \
+   '[{"source":"testnet","branch":"ci/merge-testnet-into-staging"}]'
+ck "a fork's pull request is not ours" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=3 FORK_testnet=1 MISSING_testnet=0)" '["testnet"]'
+ck "one source failing skips only it" \
+   "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=fail AHEAD_mainnet=2)" '["mainnet"] rc=1'
+ck "a source that is the target fails" \
+   "$(mb_check SOURCES='staging' AHEAD_staging=0)" ' rc=1'
+
+echo "== merge-branches: merging, conflicts and reviewers =="
+# A real git remote, so the merge, the push and what the branch ends up holding
+# are git's own answers. Commit subjects stand in for the API: `pr:N:login` is
+# a commit from merged pull request N by login, `direct:login` one with none.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$mb_tmp/gitconfig"
+git config -f "$GIT_CONFIG_GLOBAL" user.name test
+git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
+git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch staging
+git config -f "$GIT_CONFIG_GLOBAL" advice.detachedHead false
+git init -q --bare "$mb_tmp/origin.git"
+# Logs pushes into the same log as the gh stub, so their order is checked.
+printf '#!/bin/sh\necho push >> %q\n' "$mb_tmp/log" > "$mb_tmp/origin.git/hooks/pre-receive"
+chmod +x "$mb_tmp/origin.git/hooks/pre-receive"
+cat > "$mb_tmp/bin/gh" <<'GHEOF'
+#!/bin/bash
+. "$MB_JQ_ARG"
+args="$*"
+lookup_fail() { [ -n "${MB_LOOKUP_FAIL:-}" ] && { echo '{"message":"Bad credentials"}'; exit 1; }; }
+case "$*" in
+  "pr list"*) [ -n "${MB_ON_PR_LIST:-}" ] && bash "$MB_ON_PR_LIST" >/dev/null 2>&1
+    jq -n --arg o "$MB_PR" --arg f "${MB_FORK_PR:-}" \
+      '[($f | select(. != "") | {number: tonumber, isCrossRepository: true}),
+        ($o | select(. != "") | {number: tonumber, isCrossRepository: false})]' \
+      | jq -r "$(jq_arg "$@")";;
+  "api users/"*) echo 12345;;
+  *"/commits/"*"/pulls "*) lookup_fail; s=${args#*/commits/}; s=$(git log -1 --format=%s "${s%%/*}")
+    [[ $s == pr:* ]] && { s=${s#pr:}; echo "${s%%:*} ${s#*:}"; };;
+  *"/commits/"*) lookup_fail; s=${args#*/commits/}; s=$(git log -1 --format=%s "${s%% *}")
+    [[ $s == direct:* ]] && echo "${s#direct:}";;
+  *"/pulls/7/reviews"*) lookup_fail; printf 'bob\nalice\nrenovate[bot]\n';;
+  *"/pulls/14/reviews"*) lookup_fail; seq -f 'r%02g' 20;;
+  *"/reviews"*) lookup_fail; echo frank;;
+  *requested_reviewers*|"label create"*|"pr comment"*|"pr edit"*|"pr ready"*) echo "gh $*" >> "$MB_LOG";;
+  "pr create"*) echo "gh $*" >> "$MB_LOG"; echo https://github.com/o/r/pull/42;;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$mb_tmp/bin/gh"
+
+git init -q "$mb_tmp/seed"
+mb_git() { git -C "$mb_tmp/seed" "$@"; }
+mb_commit() { # branch subject file content ("-" deletes the file)
+  mb_git checkout -q "$1"
+  if [ "$4" = - ]; then mb_git rm -q "$3"; else echo "$4" > "$mb_tmp/seed/$3"; mb_git add "$3"; fi
+  mb_git commit -q -m "$2"
+  mb_git push -q origin "$1"
+}
+mb_git remote add origin "$mb_tmp/origin.git"
+echo 1 > "$mb_tmp/seed/a"; echo 1 > "$mb_tmp/seed/c"
+mb_git add a c; mb_git commit -q -m base
+mb_git branch testnet; mb_git branch mainnet
+mb_git push -q origin staging testnet mainnet
+mb_commit staging "staging edits c" c 2
+mb_commit testnet "pr:7:alice" a 2
+mb_commit testnet "direct:carol" b 1
+mb_commit mainnet "pr:9:dave" c -
+
+mb_run() { # source  open-pr-number-or-empty -> the step's exit code
+  rm -rf "$mb_tmp/work"
+  git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
+  : > "$mb_tmp/log"
+  ( cd "$mb_tmp/work" || exit 99
+    PATH="$mb_tmp/bin:$PATH" MB_LOG="$mb_tmp/log" MB_PR="$2" MB_JQ_ARG="$mb_tmp/jq_arg" GH_TOKEN=x APP_SLUG=merge-bot REPO=o/r \
+      TARGET=staging SOURCE="$1" BRANCH="ci/merge-$1-into-staging" \
+      GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=1 GITHUB_WORKFLOW=w \
+      bash "$mb_tmp/merge.sh" ) > "$mb_tmp/out" 2>&1
+  echo "$?"
+}
+mb_order() { grep -oE '^(push|gh (label create|pr create|pr edit|pr ready|pr comment))' "$mb_tmp/log" | tr '\n' '|'; }
+mb_reviewers() { sed -n 's/.*reviewers\[\]=\([^ ]*\).*/\1/p' "$mb_tmp/log" | tr '\n' ' '; }
+mb_tip() { git -C "$mb_tmp/origin.git" rev-parse "refs/heads/ci/merge-$1-into-staging"; }
+mb_has() { git -C "$mb_tmp/origin.git" merge-base --is-ancestor "$2" "$(mb_tip "$1")"; echo "$?"; }
+# A person pushing to the bot's branch: checks it out, changes a file, pushes.
+mb_human() { # source file content -> the pushed commit
+  local b="ci/merge-$1-into-staging"
+  mb_git fetch -q origin
+  mb_git checkout -q -B "$b" "origin/$b"
+  mb_commit "$b" "resolve $2" "$2" "$3"
+  mb_git rev-parse HEAD
+}
+
+ck "clean: the step succeeds"          "$(mb_run testnet '')" "0"
+ck "clean: pushes, then opens"         "$(mb_order)" "push|gh pr create|"
+ck "clean: not a draft"                "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+ck "clean: the branch holds testnet"   "$(mb_has testnet "$(mb_git rev-parse testnet)")" "0"
+# alice wrote #7 and reviewed it too, renovate[bot] is not a person, and carol's
+# commit has no pull request.
+ck "clean: authors and reviewers"      "$(mb_reviewers)" "alice bob carol "
+
+ck "rerun: the step succeeds"          "$(mb_run testnet 42)" "0"
+ck "rerun: does nothing"               "$(cat "$mb_tmp/log")" ""
+
+# mainnet deletes c, which staging edited: a conflict that leaves no markers.
+ck "conflict: the step succeeds"       "$(mb_run mainnet '')" "0"
+ck "conflict: labels before the push"  "$(mb_order)" "gh label create|push|gh pr create|"
+ck "conflict: opened as a draft"       "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+ck "conflict: the commit names c" \
+   "$(git -C "$mb_tmp/origin.git" log -1 --format=%B "$(mb_tip mainnet)" | grep -c '^    c$')" "1"
+ck "conflict: author and reviewer"     "$(mb_reviewers)" "dave frank "
+
+resolved=$(mb_human mainnet c -)
+mb_commit mainnet "pr:11:erin" d 1
+# hana merged a branch carrying pull request #99 and pushed the merge directly,
+# so the merge commit has no pull request but #99's people are still asked.
+mb_git checkout -q -b side mainnet
+mb_commit side "pr:99:ivan" e 1
+mb_git checkout -q mainnet
+mb_git merge -q --no-ff -m "direct:hana" side
+mb_git push -q origin mainnet
+# A fork's pull request from a branch of the same name is listed first.
+ck "update: the step succeeds"         "$(MB_FORK_PR=77 mb_run mainnet 43)" "0"
+ck "update: pushes, then comments"     "$(mb_order)" "push|gh pr comment|"
+ck "update: on ours, not the fork's"   "$(grep -c '^gh pr comment 43 ' "$mb_tmp/log")" "1"
+# frank reviewed #11 and #99, so he comes first.
+ck "update: inside a direct merge"     "$(mb_reviewers)" "frank erin hana ivan "
+ck "update: keeps the resolution"      "$(mb_has mainnet "$resolved")" "0"
+ck "update: carries the new commit"    "$(mb_has mainnet "$(mb_git rev-parse mainnet)")" "0"
+
+# Someone edited a on the open pull request's branch; testnet now edits a too.
+mine=$(mb_human testnet a human)
+mb_commit testnet "pr:12:gina" a 3
+ck "new conflict: the step succeeds"   "$(mb_run testnet 42)" "0"
+ck "new conflict: gated, then pushed" \
+   "$(mb_order)" "gh label create|gh pr edit|gh pr ready|push|gh pr comment|"
+ck "new conflict: back to draft"       "$(grep -c 'pr ready 42 --undo' "$mb_tmp/log")" "1"
+ck "new conflict: keeps their commit"  "$(mb_has testnet "$mine")" "0"
+
+# The pull request was closed, so the branch is rebuilt from staging, and the
+# API refuses every lookup.
+ck "lookups fail: the step succeeds" \
+   "$(MB_LOOKUP_FAIL=1 mb_run testnet '')" "0"
+ck "lookups fail: no review requested" "$(mb_reviewers)" ""
+# Three new commits, none with a pull request found, so two lookups each.
+ck "lookups fail: warned"              "$(grep -c '::warning::lookup failed' "$mb_tmp/out")" "6"
+ck "closed: the old branch is replaced" "$(mb_has testnet "$mine")" "1"
+
+# The pull request is closed again, and someone pushes to its branch after the
+# run fetched it: the run fails rather than overwrite them.
+cat > "$mb_tmp/race.sh" <<RACE
+git -C "$mb_tmp/seed" fetch -q origin
+git -C "$mb_tmp/seed" checkout -q -B late origin/ci/merge-testnet-into-staging
+echo late > "$mb_tmp/seed/late"
+git -C "$mb_tmp/seed" add late
+git -C "$mb_tmp/seed" commit -q -m late
+git -C "$mb_tmp/seed" push -q origin late:ci/merge-testnet-into-staging
+RACE
+mb_commit testnet "pr:15:kim" f 1
+ck "race: the push is refused" \
+   "$(MB_ON_PR_LIST="$mb_tmp/race.sh" mb_run testnet '')" "1"
+ck "race: their commit is kept"        "$(mb_has testnet "$(mb_git rev-parse late)")" "0"
+
+# #14 has twenty reviewers: fifteen are asked, the most involved first.
+mb_commit mainnet "pr:14:jo" g 1
+ck "many: the step succeeds"           "$(mb_run mainnet 43)" "0"
+ck "many: at most fifteen"             "$(grep -c requested_reviewers "$mb_tmp/log")" "15"
+ck "many: says so"                     "$(grep -c '::warning::requesting review from 15 of 21' "$mb_tmp/out")" "1"
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+rm -rf "$mb_tmp"
 
 rm -rf "$no_aws"
 echo

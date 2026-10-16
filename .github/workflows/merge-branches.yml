@@ -1,0 +1,241 @@
+# Keeps one pull request open from each source branch into the target while the
+# source has commits the target lacks. Conflicts are committed with their
+# markers, labelled, and the pull request is a draft until people resolve them.
+#
+# Usage and setup: "Merging branches" in README.md.
+name: merge-branches
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: The branch that pull requests merge into.
+        type: string
+        required: true
+      sources:
+        description: Space-separated branches to merge into the target.
+        type: string
+        required: true
+    secrets:
+      # Not required: the caller's job has no environment, so the value it
+      # passes is empty. The merge job sets the environment and receives the
+      # environment's value; a missing key fails the app-token step.
+      MERGE_BOT_APP_KEY:
+        required: false
+
+permissions: {}
+
+env:
+  REPO: ${{ github.repository }}
+  TARGET: ${{ inputs.target }}
+  SOURCES: ${{ inputs.sources }}
+
+jobs:
+  # Runs without the merge-bot environment, so a run with nothing to merge
+  # never loads the app key.
+  check:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: read }
+    outputs:
+      pending: ${{ steps.check.outputs.pending }}
+    steps:
+      - name: Find the sources with commits to merge
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pending=()
+          failed=0
+          for src in $SOURCES; do
+            if [ "$src" = "$TARGET" ]; then
+              echo "::error::$src is both a source and the target" >&2
+              exit 1
+            fi
+            head="ci/merge-$src-into-$TARGET"
+            # A failed lookup skips only this source; the run still fails.
+            if ! ahead=$(gh api "repos/$REPO/compare/$TARGET...$src" --jq .ahead_by); then
+              echo "::error::could not compare $src with $TARGET" >&2
+              failed=1
+              continue
+            fi
+            if [ "$ahead" = 0 ]; then
+              echo "$src: nothing to merge"
+              continue
+            fi
+            # --head matches a fork's branch of the same name too.
+            if ! open=$(gh pr list -R "$REPO" --head "$head" --base "$TARGET" --state open \
+                          --json isCrossRepository --jq 'map(select(.isCrossRepository | not)) | length'); then
+              echo "::error::could not list pull requests from $head" >&2
+              failed=1
+              continue
+            fi
+            if [ "$open" != 0 ] && [ "$(gh api "repos/$REPO/compare/$head...$src" --jq .ahead_by)" = 0 ]; then
+              echo "$src: the open pull request already carries $src"
+              continue
+            fi
+            echo "$src: $ahead commit(s) to merge"
+            pending+=("$src $head")
+          done
+          echo "pending=$(jq -cn '[$ARGS.positional[] | split(" ") | {source: .[0], branch: .[1]}]' --args "${pending[@]}")" >> "$GITHUB_OUTPUT"
+          exit "$failed"
+
+  merge:
+    needs: check
+    # Runs for the sources the check job could answer, even if another failed.
+    if: ${{ !cancelled() && needs.check.outputs.pending != '' && needs.check.outputs.pending != '[]' }}
+    name: Merge ${{ matrix.source }} into ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    # The caller's environment, which admits only runs on the target branch, so
+    # a workflow on any other branch cannot read the app key.
+    environment: merge-bot
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.pending) }}
+    env:
+      SOURCE: ${{ matrix.source }}
+      BRANCH: ${{ matrix.branch }}
+    steps:
+      # A push made with github.token starts no workflows, so CI would never run
+      # on the pull request. `workflows: write` lets the merge commit carry
+      # changes to .github/workflows.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target }}
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Merge and open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          git config user.name "$bot"
+          git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
+
+          label=merge-conflict
+          src=$(git rev-parse "origin/$SOURCE")
+          # --head matches a fork's branch of the same name too.
+          pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
+                 --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
+          if [ -n "$pr" ]; then
+            # Builds on the branch as people left it, so a pushed conflict
+            # resolution is never overwritten.
+            base=$BRANCH
+            force=()
+          else
+            # With no open pull request, a branch left by a closed one is
+            # replaced, unless someone pushed to it after this run fetched it.
+            base=$TARGET
+            force=(--force-with-lease="refs/heads/$BRANCH:$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH" || true)")
+          fi
+          git checkout -B "$BRANCH" "origin/$base"
+          if git merge-base --is-ancestor "$src" HEAD; then
+            echo "$BRANCH already contains $SOURCE"
+            exit 0
+          fi
+          new_commits=$(git rev-list "HEAD..$src")
+
+          # A modify/delete, rename or binary conflict leaves no markers, and
+          # `git add -A` then keeps one side silently, so the unmerged paths are
+          # recorded before staging.
+          subject="Merge $SOURCE into $TARGET"
+          warning=
+          draft=()
+          if ! git merge --no-ff --no-edit -m "$subject" "$src"; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if [ "${#conflicts[@]}" = 0 ]; then
+              echo "::error::git merge failed without reporting a conflict" >&2
+              exit 1
+            fi
+            git add -A
+            git commit --no-verify -F - <<EOF
+          $subject
+
+          Committed with these paths unresolved:
+          $(printf '    %s\n' "${conflicts[@]}")
+          EOF
+            # Gated before the push: once the branch carries the source, the
+            # next run has nothing to redo.
+            gh label create "$label" --force --color B60205 --description "Committed with unresolved merge conflicts"
+            if [ -n "$pr" ]; then
+              gh pr edit "$pr" --add-label "$label"
+              gh pr ready "$pr" --undo
+            fi
+            draft=(--draft --label "$label")
+            warning="
+
+          > [!WARNING]
+          > The merge has conflicts. They are committed as git left them, and this pull request is a draft until they are resolved. A delete or binary conflict has no markers, so check every file listed:
+          >
+          $(printf "> - \`%s\`\n" "${conflicts[@]}")
+          >
+          > To resolve, check out \`$BRANCH\`, fix these files, and push the fix as its own commit. Then remove the \`$label\` label and mark the pull request ready for review."
+          fi
+
+          git push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
+
+          summary="Merges $(wc -l <<< "$new_commits") new commit(s) from \`$SOURCE\` at ${src:0:9}.$warning"
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "$summary"
+          else
+            body="Merges \`$SOURCE\` into \`$TARGET\`. Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow.
+
+          $summary
+
+          Changes on \`$SOURCE\`: $GITHUB_SERVER_URL/$REPO/compare/$TARGET...$SOURCE
+
+          Review is requested from the authors and reviewers of the pull requests these commits came from. When \`$SOURCE\` moves, the workflow merges it into this branch again and never force-pushes, so a resolution pushed here is kept."
+            pr=$(gh pr create --head "$BRANCH" --base "$TARGET" --title "$subject" --body "$body" "${draft[@]}" | sed 's|.*/||')
+          fi
+
+          # Authors and reviewers of the merged pull requests behind the new
+          # commits, or the commit author where a commit has no pull request.
+          # Lookups are best effort. On failure `gh api` prints the error body
+          # to stdout, so `lookup` drops it.
+          lookup() {
+            local out
+            if out=$(gh api "$@"); then
+              printf '%s\n' "$out"
+            else
+              echo "::warning::lookup failed: gh api $*" >&2
+            fi
+          }
+          logins=$(
+            for sha in $new_commits; do
+              lookup "repos/$REPO/commits/$sha/pulls" --jq '.[] | select(.merged_at != null) | "\(.number) \(.user.login)"' | grep . \
+                || lookup "repos/$REPO/commits/$sha" --jq '.author.login // empty'
+            done | sort -u | while read -r n author; do
+              # A line with no author is a commit author's login.
+              if [ -z "$author" ]; then
+                echo "$n"
+                continue
+              fi
+              echo "$author"
+              lookup --paginate "repos/$REPO/pulls/$n/reviews" --jq '.[].user.login' | sort -u
+            done
+          )
+          # Most pull requests first, and at most `max` people.
+          max=15
+          mapfile -t ranked < <(sed -e '/^$/d' -e '/\[bot\]$/d' <<< "$logins" | sort | uniq -c | sort -k1,1nr -k2,2 | awk '{print $2}')
+          if [ "${#ranked[@]}" -gt "$max" ]; then
+            echo "::warning::requesting review from $max of ${#ranked[@]} people"
+          fi
+          for login in "${ranked[@]:0:$max}"; do
+            gh api "repos/$REPO/pulls/$pr/requested_reviewers" -f "reviewers[]=$login" --silent \
+              || echo "::warning::could not request review from $login"
+          done
