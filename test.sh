@@ -78,13 +78,15 @@ ck "the README documents one repository, not two" \
       | LC_ALL=C sort -u | tr '\n' ' ')" "gh-actions "
 
 
-echo "== what runs holding the role or an app key is pinned =="
-# The trust policy names start-runner.yml at a tag, not what it pulls in, so an
-# action it uses by tag is trusted to whoever can move that tag. A SHA cannot be
-# moved; dependabot.yml keeps the pins current. merge-branches.yml holds the
-# merge-bot app key, so the same goes for it.
-ck "every action the workflow and actions use is pinned to a SHA" \
-   "$(grep -rhoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' "$REPO/.github/workflows/start-runner.yml" "$REPO/.github/workflows/merge-branches.yml" "$REPO/.github/actions" \
+echo "== what callers run is pinned =="
+# A shared workflow or action runs with its caller's credentials: the fleet's
+# AWS role, an App key. A caller pins this repository at a tag, not what it
+# pulls in, so an action used by tag is trusted to whoever can move that tag. A
+# SHA cannot be moved; dependabot.yml keeps the pins current. ci.yml is this
+# repository's own CI, which no caller runs.
+ck "every action the workflows and actions use is pinned to a SHA" \
+   "$(find "$REPO/.github/workflows" "$REPO/.github/actions" -name '*.yml' ! -path '*/workflows/ci.yml' -print0 \
+      | xargs -0 grep -hoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' \
       | sed -E 's/.*uses:[[:space:]]*//' | grep -vE '@[0-9a-f]{40}$' | tr '\n' ' ')" ""
 
 echo "== fleet sizing: this repo's queue, plus the boxes busy elsewhere =="
@@ -1010,23 +1012,23 @@ open('$mb_tmp/check.sh', 'w').write(st['Find the sources with commits to merge']
 open('$mb_tmp/merge.sh', 'w').write(st['Merge and open or update the pull request']['run'])
 "
 # AHEAD_<src> is how far the source is ahead of the target, OPEN_<src> how many
-# pull requests are open for it, BEHIND_<src> how far that pull request's
-# branch is behind the source.
+# pull requests are open for it, MISSING_<src> how many of the source's commits
+# that pull request's branch lacks.
 cat > "$mb_tmp/bin-check/gh" <<'GHEOF'
 #!/bin/bash
 case "$*" in
   *"compare/$TARGET..."*) v="AHEAD_${2##*...}"; echo "${!v}";;
   *"pr list"*) h="$*"; h="${h#*--head ci/merge-}"; v="OPEN_${h%%-into-*}"; echo "${!v:-0}";;
-  *compare/*) s="${2#*compare/}"; v="BEHIND_${s%%...*}"; echo "${!v}";;
+  *compare/ci/merge-*) s="${2#*compare/ci/merge-}"; v="MISSING_${s%%-into-*}"; echo "${!v}";;
   *) echo "unexpected: gh $*" >&2; exit 1;;
 esac
 GHEOF
 chmod +x "$mb_tmp/bin-check/gh"
-mb_check() { # env assignments -> the sources output, or "rc=N" if the step failed
+mb_check() { # env assignments -> the pending sources, or "rc=N" if the step failed
   : > "$mb_tmp/out"
   if env "$@" PATH="$mb_tmp/bin-check:$PATH" REPO=o/r TARGET=staging GITHUB_OUTPUT="$mb_tmp/out" \
        bash "$mb_tmp/check.sh" >/dev/null 2>&1; then
-    sed -n 's/^sources=//p' "$mb_tmp/out"
+    sed -n 's/^pending=//p' "$mb_tmp/out" | jq -c '[.[].source]'
   else
     echo "rc=$?"
   fi
@@ -1036,11 +1038,14 @@ ck "nothing ahead, nothing to run" \
 ck "ahead with no pull request" \
    "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=3 AHEAD_mainnet=0)" '["testnet"]'
 ck "an open pull request carries it" \
-   "$(mb_check SOURCES='testnet' AHEAD_testnet=3 OPEN_testnet=1 BEHIND_testnet=0)" '[]'
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=3 OPEN_testnet=1 MISSING_testnet=0)" '[]'
 ck "the source moved past it" \
-   "$(mb_check SOURCES='testnet' AHEAD_testnet=4 OPEN_testnet=1 BEHIND_testnet=1)" '["testnet"]'
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=4 OPEN_testnet=1 MISSING_testnet=1)" '["testnet"]'
 ck "both sources, in order" \
    "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=1 AHEAD_mainnet=2)" '["testnet","mainnet"]'
+ck "each names the branch it merges into" \
+   "$(mb_check SOURCES='testnet' AHEAD_testnet=1 >/dev/null; sed -n 's/^pending=//p' "$mb_tmp/out")" \
+   '[{"source":"testnet","branch":"ci/merge-testnet-into-staging"}]'
 ck "a source that is the target fails" \
    "$(mb_check SOURCES='staging' AHEAD_staging=0)" 'rc=1'
 
@@ -1057,15 +1062,12 @@ git init -q --bare "$mb_tmp/origin.git"
 # Logs pushes into the same log as the gh stub, so their order is checked.
 printf '#!/bin/sh\necho push >> %q\n' "$mb_tmp/log" > "$mb_tmp/origin.git/hooks/pre-receive"
 chmod +x "$mb_tmp/origin.git/hooks/pre-receive"
-cat > "$mb_tmp/bin/gh" <<GHEOF
+cat > "$mb_tmp/bin/gh" <<'GHEOF'
 #!/bin/bash
-LOG=$(printf %q "$mb_tmp/log")
-GHEOF
-cat >> "$mb_tmp/bin/gh" <<'GHEOF'
 args="$*"
 lookup_fail() { [ -n "${MB_LOOKUP_FAIL:-}" ] && { echo '{"message":"Bad credentials"}'; exit 1; }; }
 case "$*" in
-  "pr list"*) cat "${MB_PR_FILE}";;
+  "pr list"*) echo "$MB_PR";;
   "api users/"*) echo 12345;;
   *"/commits/"*"/pulls "*) lookup_fail; s=${args#*/commits/}; s=$(git log -1 --format=%s "${s%%/*}")
     [[ $s == pr:* ]] && { s=${s#pr:}; echo "${s%%:*} ${s#*:}"; };;
@@ -1073,8 +1075,8 @@ case "$*" in
     [[ $s == direct:* ]] && echo "${s#direct:}";;
   *"/pulls/7/reviews"*) lookup_fail; printf 'bob\nalice\nrenovate[bot]\n';;
   *"/reviews"*) lookup_fail; echo frank;;
-  *requested_reviewers*|"label create"*|"pr comment"*|"pr edit"*|"pr ready"*) echo "gh $*" >> "$LOG";;
-  "pr create"*) echo "gh $*" >> "$LOG"; echo https://github.com/o/r/pull/42;;
+  *requested_reviewers*|"label create"*|"pr comment"*|"pr edit"*|"pr ready"*) echo "gh $*" >> "$MB_LOG";;
+  "pr create"*) echo "gh $*" >> "$MB_LOG"; echo https://github.com/o/r/pull/42;;
   *) echo "unexpected: gh $*" >&2; exit 1;;
 esac
 GHEOF
@@ -1101,11 +1103,10 @@ mb_commit mainnet "pr:9:dave" c -
 mb_run() { # source  open-pr-number-or-empty -> the step's exit code
   rm -rf "$mb_tmp/work"
   git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
-  echo "$2" > "$mb_tmp/pr"
   : > "$mb_tmp/log"
   ( cd "$mb_tmp/work" || exit 99
-    PATH="$mb_tmp/bin:$PATH" MB_PR_FILE="$mb_tmp/pr" GH_TOKEN=x APP_SLUG=merge-bot REPO=o/r \
-      TARGET=staging SOURCE="$1" LABEL=merge-conflict \
+    PATH="$mb_tmp/bin:$PATH" MB_LOG="$mb_tmp/log" MB_PR="$2" GH_TOKEN=x APP_SLUG=merge-bot REPO=o/r \
+      TARGET=staging SOURCE="$1" BRANCH="ci/merge-$1-into-staging" \
       GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=1 GITHUB_WORKFLOW=w \
       bash "$mb_tmp/merge.sh" ) > "$mb_tmp/out" 2>&1
   echo "$?"
@@ -1116,11 +1117,10 @@ mb_tip() { git -C "$mb_tmp/origin.git" rev-parse "refs/heads/ci/merge-$1-into-st
 mb_has() { git -C "$mb_tmp/origin.git" merge-base --is-ancestor "$2" "$(mb_tip "$1")"; echo "$?"; }
 # A person pushing to the bot's branch: checks it out, changes a file, pushes.
 mb_human() { # source file content -> the pushed commit
+  local b="ci/merge-$1-into-staging"
   mb_git fetch -q origin
-  mb_git checkout -q -B human "origin/ci/merge-$1-into-staging"
-  if [ "$3" = - ]; then mb_git rm -q "$2"; else echo "$3" > "$mb_tmp/seed/$2"; mb_git add "$2"; fi
-  mb_git commit -q -m "resolve $2"
-  mb_git push -q origin "human:ci/merge-$1-into-staging"
+  mb_git checkout -q -B "$b" "origin/$b"
+  mb_commit "$b" "resolve $2" "$2" "$3"
   mb_git rev-parse HEAD
 }
 
@@ -1145,8 +1145,16 @@ ck "conflict: author and reviewer"     "$(mb_reviewers)" "dave frank "
 
 resolved=$(mb_human mainnet c -)
 mb_commit mainnet "pr:11:erin" d 1
+# Pull request #13 merged a branch whose own commit maps to #99. The merge
+# commit is the one that names the pull request, so #99 is never looked up.
+mb_git checkout -q -b side mainnet
+mb_commit side "pr:99:ivan" e 1
+mb_git checkout -q mainnet
+mb_git merge -q --no-ff -m "pr:13:hana" side
+mb_git push -q origin mainnet
 ck "update: the step succeeds"         "$(mb_run mainnet 43)" "0"
 ck "update: pushes, then comments"     "$(mb_order)" "push|gh pr comment|"
+ck "update: first-parent lookups"      "$(mb_reviewers)" "erin frank hana "
 ck "update: keeps the resolution"      "$(mb_has mainnet "$resolved")" "0"
 ck "update: carries the new commit"    "$(mb_has mainnet "$(mb_git rev-parse mainnet)")" "0"
 

@@ -123,8 +123,7 @@ count it could not take.
 ## Merging branches
 
 `merge-branches.yml` keeps one pull request open from each source branch into a
-target branch while the source has commits the target lacks. snarkVM uses it to
-merge `testnet` and `mainnet` into `staging`.
+target branch while the source has commits the target lacks.
 
 - The pull request comes from `ci/merge-<source>-into-<target>`. Review is
   requested from the authors and reviewers of the merged pull requests behind
@@ -158,11 +157,11 @@ jobs:
       MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
 ```
 
-**It pushes and opens pull requests as a GitHub App**, because a push or pull
-request made with `github.token` starts no workflows, so CI would never run on
-the pull request. Use the single-purpose **aleo-labs merge-bot** App, not the one
-that administers CI. It holds contents, pull requests, issues and workflows
-write, and nothing else. Install it on the calling repository.
+**It pushes as a GitHub App**, because a push made with `github.token` starts no
+workflows. The App is the single-purpose **aleo-labs merge-bot**, for the reason
+given under [Giving a caller the fleet-wide view](#giving-a-caller-the-fleet-wide-view).
+It holds contents, pull requests, issues and workflows write, and nothing else.
+Install it on the calling repository.
 
 Its key lives in an environment named **`merge-bot`** in the calling
 repository, whose deployment branches admit only the target branch:
@@ -210,9 +209,9 @@ a caller branch points at that tag, and the tag is deleted afterwards. The
 ruleset covers it like any other `v*`, and `check-shared-refs` fails on it, so it
 cannot be merged by accident.
 
-The actions `start-runner.yml` uses run holding the role, and the trust policy
-names this file, not what it pulls in, so they are pinned to commit SHAs;
-Dependabot proposes the updates.
+The actions the shared workflows use run with their callers' credentials: the
+fleet's AWS role, an App key. A caller pins this repository, not what it pulls
+in, so they are pinned to commit SHAs; Dependabot proposes the updates.
 
 ## Development
 
