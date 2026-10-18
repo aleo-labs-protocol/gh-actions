@@ -1009,7 +1009,6 @@ import yaml
 d = yaml.safe_load(open('$REPO/.github/workflows/merge-branches.yml'))
 st = {x.get('name'): x for j in d['jobs'].values() for x in j['steps'] if x.get('name')}
 open('$mb_tmp/check.sh', 'w').write(st['Find the sources with commits to merge']['run'])
-open('$mb_tmp/merge.sh', 'w').write(st['Merge and open or update the pull request']['run'])
 "
 # Both stubs answer `pr list` with JSON run through the step's own --jq, so the
 # step's filtering is what is tested.
@@ -1079,6 +1078,7 @@ printf '#!/bin/sh\necho push >> %q\n' "$mb_tmp/log" > "$mb_tmp/origin.git/hooks/
 chmod +x "$mb_tmp/origin.git/hooks/pre-receive"
 cat > "$mb_tmp/bin/gh" <<'GHEOF'
 #!/bin/bash
+[ "${GH_TOKEN:-}" = tok-SECRET ] || { echo "gh without the app token: gh $*" >&2; exit 1; }
 . "$MB_JQ_ARG"
 args="$*"
 lookup_fail() { [ -n "${MB_LOOKUP_FAIL:-}" ] && { echo '{"message":"Bad credentials"}'; exit 1; }; }
@@ -1121,15 +1121,54 @@ mb_commit testnet "pr:7:alice" a 2
 mb_commit testnet "direct:carol" b 1
 mb_commit mainnet "pr:9:dave" c -
 
-mb_run() { # source  open-pr-number-or-empty -> the step's exit code
-  rm -rf "$mb_tmp/work"
-  git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
-  : > "$mb_tmp/log"
+# The merge job's steps, each run as the runner would: only if its `if:` holds,
+# and with the env its YAML gives it. The app token is tok-SECRET, so a step
+# or script that can see it is caught.
+cat > "$mb_tmp/step.py" <<'PYEOF'
+import re, sys, yaml
+wf, name, outputs, script, *inputs = sys.argv[1:]
+d = yaml.safe_load(open(wf))
+st = next(x for x in d['jobs']['merge']['steps'] if x.get('name') == name)
+inputs = dict(i.split('=', 1) for i in inputs)
+outs = dict(l.rstrip('\n').split('=', 1) for l in open(outputs) if '=' in l)
+def ref(r):
+    r = r.strip()
+    if r == 'steps.app.outputs.token': return 'tok-SECRET'
+    if r == 'steps.app.outputs.app-slug': return 'merge-bot'
+    if r.startswith('steps.merge.outputs.'): return outs.get(r[len('steps.merge.outputs.'):], '')
+    if r.startswith('inputs.'): return inputs.get(r[len('inputs.'):], '')
+    sys.exit('unknown expression: ' + r)
+def holds(c):
+    for part in c.split('&&'):
+        m = re.fullmatch(r"\s*(\S+)\s*(==|!=)\s*'([^']*)'\s*", part)
+        if not m: sys.exit('unknown condition: ' + part)
+        if (ref(m[1]) == m[3]) != (m[2] == '=='): return False
+    return True
+print('run' if 'if' not in st or holds(st['if']) else 'skip')
+for k, v in (st.get('env') or {}).items():
+    print(k + '=' + re.sub(r'\$\{\{(.*?)\}\}', lambda m: ref(m[1]), str(v)))
+open(script, 'w').write(st['run'])
+PYEOF
+mb_wf="$REPO/.github/workflows/merge-branches.yml"
+mb_step() { # step name -> its exit code; skipped when its condition is false
+  local e rc
+  mapfile -t e < <(python3 "$mb_tmp/step.py" "$mb_wf" "$1" "$mb_tmp/outputs" "$mb_tmp/step.sh" ${MB_POST_MERGE:+"post-merge=$MB_POST_MERGE"})
+  case "${e[0]:-}" in run) ;; skip) return 0;; *) echo "step.py failed for $1"; return 98;; esac
   ( cd "$mb_tmp/work" || exit 99
-    PATH="$mb_tmp/bin:$PATH" MB_LOG="$mb_tmp/log" MB_PR="$2" MB_JQ_ARG="$mb_tmp/jq_arg" GH_TOKEN=x APP_SLUG=merge-bot REPO=o/r \
-      TARGET=staging SOURCE="$1" BRANCH="ci/merge-$1-into-staging" \
+    env "${e[@]:1}" PATH="$mb_tmp/bin:$PATH" MB_LOG="$mb_tmp/log" MB_PR="$MB_PR" MB_JQ_ARG="$mb_tmp/jq_arg" REPO=o/r \
+      TARGET=staging SOURCE="$MB_SOURCE" BRANCH="ci/merge-$MB_SOURCE-into-staging" \
       GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=1 GITHUB_WORKFLOW=w \
-      bash "$mb_tmp/merge.sh" ) > "$mb_tmp/out" 2>&1
+      RUNNER_TEMP="$mb_tmp/runner" GITHUB_OUTPUT="$mb_tmp/outputs" bash "$mb_tmp/step.sh" )
+}
+mb_run() { # source  open-pr-number-or-empty -> the job's exit code
+  rm -rf "$mb_tmp/work" "$mb_tmp/runner"
+  git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
+  mkdir "$mb_tmp/runner"
+  : > "$mb_tmp/log"; : > "$mb_tmp/outputs"
+  local MB_SOURCE=$1 MB_PR=$2
+  { mb_step "Merge the source without committing" &&
+    mb_step "Run the post-merge script" &&
+    mb_step "Commit, push, and open or update the pull request"; } > "$mb_tmp/out" 2>&1
   echo "$?"
 }
 mb_order() { grep -oE '^(push|gh (label create|pr create|pr edit|pr ready|pr comment))' "$mb_tmp/log" | tr '\n' '|'; }
@@ -1220,6 +1259,145 @@ mb_commit mainnet "pr:14:jo" g 1
 ck "many: the step succeeds"           "$(mb_run mainnet 43)" "0"
 ck "many: at most fifteen"             "$(grep -c requested_reviewers "$mb_tmp/log")" "15"
 ck "many: says so"                     "$(grep -c '::warning::requesting review from 15 of 21' "$mb_tmp/out")" "1"
+
+echo "== merge-branches: the post-merge script =="
+# The script records its arguments, counts what it can see of the token, then
+# runs MB_HOOK. pinned and locked stand in for Cargo.toml and Cargo.lock.
+mb_git checkout -q staging
+mkdir -p "$mb_tmp/seed/.github"
+cat > "$mb_tmp/seed/.github/post-merge" <<'HOOK'
+#!/bin/bash
+printf '%s\n' "$@" > "$MB_HOOK_ARGS"
+{ env; git config --list
+  printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false git credential fill 2>/dev/null
+} | grep -c tok-SECRET > "$MB_HOOK_SEEN"
+eval "${MB_HOOK:-}"
+HOOK
+chmod +x "$mb_tmp/seed/.github/post-merge"
+mb_git add .github/post-merge; mb_git commit -q -m "post-merge script"
+mb_base=$(mb_git rev-parse HEAD)
+echo staging > "$mb_tmp/seed/pinned"; echo staging > "$mb_tmp/seed/locked"
+mb_git add pinned locked; mb_git commit -q -m "staging pins"; mb_git push -q origin staging
+mb_source() { # name -> a new source from before staging set pinned and locked
+  mb_git checkout -q -b "$1" "$mb_base"; mb_git push -q origin "$1"
+}
+mb_hook() { # source  open-pr  hook-commands -> the job's exit code
+  rm -f "$mb_tmp/hook-args" "$mb_tmp/hook-seen"
+  MB_POST_MERGE=.github/post-merge MB_HOOK="$3" MB_HOOK_ARGS="$mb_tmp/hook-args" MB_HOOK_SEEN="$mb_tmp/hook-seen" \
+    mb_run "$1" "$2"
+}
+mb_msg() { printf '%s\n' "$(git -C "$mb_tmp/origin.git" log -1 --format=%B "$(mb_tip "$1")")"; }
+mb_body() { sed -n '/^gh pr \(create\|comment\)/,/^gh /p' "$mb_tmp/log"; }
+mb_file() { git -C "$mb_tmp/origin.git" show "$(mb_tip "$1"):$2"; }
+
+mb_source all; mb_commit all "pr:20:lee" pinned all; mb_commit all "pr:20:lee" locked all
+ck "no input: the script does not run" "$(rm -f "$mb_tmp/hook-args"; MB_HOOK_ARGS="$mb_tmp/hook-args" MB_HOOK_SEEN=/dev/null mb_run all ''; if [ -e "$mb_tmp/hook-args" ]; then echo 0; else echo 1; fi)" "0
+1"
+ck "no input: a draft, as before"      "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+git -C "$mb_tmp/origin.git" update-ref -d refs/heads/ci/merge-all-into-staging
+
+ck "resolves all: the job succeeds" \
+   "$(mb_hook all '' 'git checkout -q --ours pinned locked && git add pinned locked')" "0"
+ck "resolves all: given the conflicts" "$(tr '\n' ' ' < "$mb_tmp/hook-args")" "locked pinned "
+ck "resolves all: sees no token"       "$(cat "$mb_tmp/hook-seen")" "0"
+ck "checkout keeps no credentials" "$(python3 -c "
+import yaml
+d = yaml.safe_load(open('$mb_wf'))
+print(next(x for x in d['jobs']['merge']['steps'] if 'checkout' in x.get('uses', ''))['with'].get('persist-credentials'))")" "False"
+# What git would send to GitHub, from the helper the merge step installed.
+mb_cred() {
+  printf 'protocol=https\nhost=github.com\n\n' |
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false git -C "$mb_tmp/work" credential fill 2>/dev/null | grep -c '^password=tok-SECRET$'
+}
+ck "resolves all: git has the token where GH_TOKEN is set" "$(GH_TOKEN=tok-SECRET mb_cred)" "1"
+ck "resolves all: and not where it is not" "$(unset GH_TOKEN; mb_cred)" "0"
+ck "resolves all: pushes, then opens"  "$(mb_order)" "push|gh pr create|"
+ck "resolves all: not a draft"         "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+ck "resolves all: keeps staging's pin" "$(mb_file all pinned)" "staging"
+ck "resolves all: the commit names them" "$(mb_msg all | sed -n '/^Changed by `.github\/post-merge`:$/,$p' | tr '\n' '|')" \
+   "Changed by \`.github/post-merge\`:|    locked|    pinned|"
+ck "resolves all: the body names them" "$(mb_body | grep -c -e '^- `locked`$' -e '^- `pinned`$' -e 'Changed by `.github/post-merge`:')" "3"
+
+ck "rerun: the script does not run"   "$(mb_hook all 42 'exit 1'; if [ -e "$mb_tmp/hook-args" ]; then echo 0; else echo 1; fi)" "0
+1"
+
+mb_source some; mb_commit some "pr:21:max" pinned some; mb_commit some "pr:21:max" locked some
+ck "resolves some: the job succeeds" \
+   "$(mb_hook some '' 'git checkout -q --ours pinned && git add pinned')" "0"
+ck "resolves some: still a draft"      "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+ck "resolves some: warns of the rest"  "$(mb_body | grep -c -e '^> - `locked`$' -e '^> - `pinned`$')" "1"
+ck "resolves some: the commit" "$(mb_msg some | sed -n '/^Changed by/,$p' | tr '\n' '|')" \
+   "Changed by \`.github/post-merge\`:|    pinned||Committed with these paths unresolved:|    locked|"
+
+# The source moves pinned where staging did not touch it: a clean merge that
+# the script undoes.
+mb_git checkout -q -b clean staging; mb_git push -q origin clean
+mb_commit clean "pr:22:noa" pinned moved; mb_commit clean "pr:22:noa" other 1
+ck "edits a clean merge: the job succeeds" \
+   "$(mb_hook clean '' 'git checkout -q HEAD -- pinned')" "0"
+ck "edits a clean merge: given nothing" "$(cat "$mb_tmp/hook-args")" ""
+ck "edits a clean merge: restored"     "$(mb_file clean pinned)" "staging"
+ck "edits a clean merge: reported"     "$(mb_msg clean | sed -n '/^Changed by/,$p' | tr '\n' '|')" \
+   "Changed by \`.github/post-merge\`:|    pinned|"
+ck "edits a clean merge: not a draft"  "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+
+ck "untouched: nothing reported" \
+   "$(mb_commit clean "pr:23:ola" other 2; mb_hook clean 44 ':' >/dev/null; mb_body | grep -c 'Changed by')" "0"
+
+mb_source fails; mb_commit fails "pr:24:pat" pinned fails
+ck "fails: the job fails"              "$(mb_hook fails '' 'exit 3')" "1"
+ck "fails: says so"                    "$(grep -c '::error::post-merge: .github/post-merge failed' "$mb_tmp/out")" "1"
+ck "fails: nothing pushed or opened"   "$(cat "$mb_tmp/log")" ""
+ck "commits: the job fails"            "$(mb_hook fails '' 'git add -A && git commit -q -m x')" "1"
+ck "commits: says so"                  "$(grep -c 'committed, aborted or replaced the merge' "$mb_tmp/out")" "1"
+ck "commits: nothing pushed or opened" "$(cat "$mb_tmp/log")" ""
+
+ck "missing: the job fails" \
+   "$(MB_POST_MERGE=.github/nope mb_run fails '')" "1"
+ck "missing: says so" \
+   "$(grep -c '::error::post-merge: .github/nope is not an executable file on staging' "$mb_tmp/out")" "1"
+ck "missing: nothing pushed or opened" "$(cat "$mb_tmp/log")" ""
+mb_git checkout -q staging; cp "$mb_tmp/seed/.github/post-merge" "$mb_tmp/seed/.github/plain"; chmod -x "$mb_tmp/seed/.github/plain"
+mb_git add .github/plain; mb_git commit -q -m plain; mb_git push -q origin staging
+ck "not executable: the job fails"     "$(MB_POST_MERGE=.github/plain mb_run fails '')" "1"
+
+# Staged with its markers: no longer unmerged, but not resolved.
+mb_source added; mb_commit added "pr:26:rio" pinned added
+ck "stages markers: the job succeeds"   "$(mb_hook added '' 'git add pinned')" "0"
+ck "stages markers: a draft"            "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+ck "stages markers: the commit" "$(mb_msg added | sed -n '/^Changed by/,$p;/^Committed with/,$p' | tr '\n' '|')" \
+   "Committed with these paths unresolved:|    pinned|"
+
+mb_source githooks; mb_commit githooks "pr:29:uma" pinned githooks
+ck "installs git hooks: the job succeeds" "$(mb_hook githooks '' 'for h in pre-push post-commit; do
+    printf "#!/bin/sh\necho %s >> %s\n" "$h" "$MB_HOOK_ARGS.githooks" > ".git/hooks/$h"; chmod +x ".git/hooks/$h"
+  done; git checkout -q --ours pinned && git add pinned')" "0"
+ck "installs git hooks: none run"       "$(cat "$mb_tmp/hook-args.githooks" 2>/dev/null)" ""
+
+mb_source moves; mb_commit moves "pr:30:val" pinned moves
+ck "moves HEAD: the job fails"          "$(mb_hook moves '' 'git update-ref HEAD HEAD^')" "1"
+ck "moves HEAD: says so"                "$(grep -c 'committed, aborted or replaced the merge' "$mb_tmp/out")" "1"
+ck "moves HEAD: nothing pushed or opened" "$(cat "$mb_tmp/log")" ""
+
+# Someone replaced the script on the open pull request's branch; staging's runs.
+mb_hook all 42 'exit 0' >/dev/null
+mb_human all .github/post-merge 'exit 7' >/dev/null
+mb_commit all "pr:25:quinn" a all
+ck "from the target: the job succeeds" "$(mb_hook all 42 ':')" "0"
+ck "from the target: staging's ran"    "$(cat "$mb_tmp/hook-seen")" "0"
+
+# The source edits a file staging deletes: a conflict without markers, kept
+# by staging it. The name is not ASCII, which git quotes by default.
+mb_git checkout -q staging; echo base > "$mb_tmp/seed/gône"; mb_git add gône; mb_git commit -q -m gône; mb_git push -q origin staging
+mb_git checkout -q -b gone staging; mb_git push -q origin gone
+mb_commit gone "pr:27:sam" gône kept
+mb_commit staging "drop gône" gône -
+ck "modify/delete: the job succeeds"    "$(mb_hook gone '' 'git add gône')" "0"
+ck "modify/delete: given the name"      "$(cat "$mb_tmp/hook-args")" "gône"
+ck "modify/delete: not a draft"         "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+ck "modify/delete: named"               "$(mb_msg gone | sed -n '/^Changed by/,$p' | tr '\n' '|')" \
+   "Changed by \`.github/post-merge\`:|    gône|"
+ck "modify/delete: kept"                "$(mb_file gone gône)" "kept"
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$mb_tmp"
 
