@@ -1407,8 +1407,6 @@ export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$ba_tmp/gitconfig"
 git config -f "$GIT_CONFIG_GLOBAL" user.name test
 git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
 git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch staging
-# The URL the step pushes to, sent to a local remote.
-git config -f "$GIT_CONFIG_GLOBAL" "url.$ba_tmp/origin.git.insteadOf" "https://x-access-token:tok-SECRET@github.com/o/r.git"
 # Each step's own run block, with the env its YAML and the workflow's give it.
 cat > "$ba_tmp/step.py" <<'PYEOF'
 import os, re, sys, yaml
@@ -1441,8 +1439,9 @@ ba_step() { # step name, env assignments -> its exit code
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
 case "$*" in
+  "pkgid "*) ;;
   "update -p "*) echo "$3" | tee -a "$BA_LOG" >> Cargo.lock;;
-  "deny --format json check advisories")
+  "deny --format json check advisories"|"deny --offline --format json check advisories")
     [ -n "${BA_BROKEN:-}" ] && { echo "error: failed to fetch the advisory database" >&2; exit 1; }
     echo '{"type":"log","fields":{"level":"INFO","message":"fetching"}}' >&2
     echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"not encountered"}}' >&2
@@ -1494,8 +1493,8 @@ ck "unfixable: Cargo.lock unchanged" "$(cat "$ba_tmp/outputs")" ""
 ck "mixed: the step succeeds"        "$(ba_bump BA_FIX=zip@8.6.0 BA_MIXED=1)" "0"
 ck "mixed: zip fixed"                "$(ba_ids fixed)" "$ba_all"
 ck "mixed: foo left"                 "$(ba_ids after)" "RUSTSEC-2026-0001 "
-ck "mixed: the parent pass undone"   "$(tr '\n' ' ' < "$ba_tmp/log"; tr '\n' ' ' < "$ba_tmp/work/Cargo.lock")" \
-   "foo@1.0.0 zip@8.6.0 bar@2.0.0 lock foo@1.0.0 zip@8.6.0 "
+ck "mixed: only the fix is kept"    "$(tr '\n' ' ' < "$ba_tmp/log"; tr '\n' ' ' < "$ba_tmp/work/Cargo.lock")" \
+   "foo@1.0.0 zip@8.6.0 bar@2.0.0 lock zip@8.6.0 "
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
 ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
 
@@ -1513,7 +1512,10 @@ case "$*" in
       | jq -r "$(jq_arg "$@")";;
   "api repos/o/r/contents/Cargo.lock?ref=ci/bump-advisories-into-staging "*) echo "${BA_SHA:-}";;
   "api users/"*) echo 12345;;
-  "issue list --label cargo-advisories "*) echo "${BA_ISSUE:-}";;
+  "issue list --label cargo-advisories "*)
+    jq -n --arg n "${BA_ISSUE:-}" '[{number: 98, title: "cargo deny advisories on mainnet"}]
+      + [$n | select(. != "") | {number: tonumber, title: "cargo deny advisories on staging"}]' \
+      | jq -r "$(jq_arg "$@")";;
   "issue view"*) cat "$BA_OLD";;
   "pr create"*|"pr edit"*|"pr close"*|"label create"*|"issue create"*|"issue edit"*|"issue comment"*|"issue close"*)
     echo "gh $1 $2" >> "$BA_LOG"
@@ -1555,10 +1557,14 @@ ck "same issue: no edit"             "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/ol
 grep -v 0369 "$ba_tmp/issue" > "$ba_tmp/old"
 ck "a new one: edits, and comments"  "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old")$(ba_log)" "0gh label create|gh issue edit|gh issue comment|"
 ck "the comment names only it"       "$(grep -c '^- \[RUSTSEC-2026-0369\]' "$ba_tmp/body.issue-comment"); $(grep -c '^- ' "$ba_tmp/body.issue-comment")" "1; 1"
+sed 's/zip 8.6.0/zip 8.5.0/' "$ba_tmp/issue" > "$ba_tmp/old"
+ck "a new version: edits, no comment" "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old")$(ba_log)" "0gh label create|gh issue edit|"
 
 ba_bump BA_CLEAN=1 >/dev/null
 ck "clean: closes both"              "$(ba_publish BA_PR=5 BA_ISSUE=3)$(ba_log)" "0gh pr close|gh issue close|"
 ck "clean: neither, nothing"         "$(ba_publish)$(ba_log)" "0"
+# ci.yml's credential-helper job checks merge-branches.yml's copy.
+ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories}.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$ba_tmp"

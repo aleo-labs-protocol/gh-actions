@@ -237,12 +237,13 @@ only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
 requests need not gate on advisories published after they were opened.
 
 - It runs `cargo update -p` on each crate reported, then on the crates that
-  depend on any still reported. The result is one pull request from
+  depend on any still reported. It keeps an update only if fewer findings
+  are left after it. The result is one pull request from
   `ci/bump-advisories-into-<target>`. A run that changes the result rebuilds
   that branch from the target and force-pushes it. A run that changes nothing
   leaves it alone, and a run with nothing to fix closes it.
-- What that cannot fix, it lists in one issue labelled `cargo-advisories`. It
-  comments when an advisory is added and closes the issue when none are left.
+- What that cannot fix, it lists in one issue labelled `cargo-advisories`
+  and titled for the target. It comments when an advisory is added and closes the issue when none are left.
   The fix is a raised requirement in a `Cargo.toml`, or an ignore with a
   reason in `deny.toml`.
 

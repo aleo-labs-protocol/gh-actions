@@ -59,47 +59,44 @@ jobs:
           mkdir -p "$dir"
           # One line per error: advisory, crate, version, the crates that
           # depend on it, title.
-          findings() {
-            local rc=0
-            cargo deny --format json check advisories 2> "$dir/deny.json" > /dev/null || rc=$?
+          findings() { # file, then cargo-deny options
+            local out=$1 rc=0
+            shift
+            cargo deny "$@" --format json check advisories 2> "$dir/deny.json" > /dev/null || rc=$?
             jq -Rr 'fromjson? | select(.type == "diagnostic" and .fields.severity == "error") | .fields as $f
                     | ($f.graphs[0] // {}) as $g
                     | [$f.advisory.id // $f.code, $g.Krate.name // "", $g.Krate.version // "",
                        ([$g.parents[]?.Krate | "\(.name)@\(.version)"] | join(" ")),
                        ($f.advisory.title // $f.message | gsub("^\\s+|\\s+$"; ""))] | @tsv' \
-              "$dir/deny.json" > "$dir/$1"
-            if [ "$rc" != 0 ] && [ ! -s "$dir/$1" ]; then
+              "$dir/deny.json" > "$dir/$out"
+            if [ "$rc" != 0 ] && [ ! -s "$dir/$out" ]; then
               cat "$dir/deny.json" >&2
               echo "::error::cargo deny failed without reporting an advisory" >&2
               exit 1
             fi
           }
-          update() {
-            for p in "$@"; do
-              cargo update -p "$p" || echo "::warning::cargo update -p $p failed"
-            done
-          }
-          keys() { cut -f1,2 "$dir/$1" | sort -u; }
-          # A pass that clears no finding is undone, so its updates do not
-          # ride along in the pull request.
-          pass() { # findings after it, findings before it, crates to update
-            local now=$1 prev=$2
-            shift 2
+          # Kept only if it leaves fewer findings, so an update that fixes
+          # nothing stays out of the pull request.
+          try() {
+            # An earlier update may have moved it.
+            cargo pkgid "$1" > /dev/null 2>&1 || return 0
             cp Cargo.lock "$dir/Cargo.lock"
-            update "$@"
-            findings "$now"
-            if [ -z "$(comm -23 <(keys "$prev") <(keys "$now"))" ]; then
+            cargo update -p "$1"
+            findings next --offline
+            if [ "$(wc -l < "$dir/next")" -lt "$(wc -l < "$dir/after")" ]; then
+              mv "$dir/next" "$dir/after"
+            else
               cp "$dir/Cargo.lock" Cargo.lock
-              cp "$dir/$prev" "$dir/$now"
             fi
           }
           findings before
-          # The crate itself, then, for what that left, the crates that pin it.
-          mapfile -t crates < <(awk -F'\t' '$2 != "" { print $2 "@" $3 }' "$dir/before" | sort -u)
-          pass crates before "${crates[@]}"
-          mapfile -t parents < <(cut -f4 "$dir/crates" | tr ' ' '\n' | sed '/^$/d' | sort -u)
-          pass after crates "${parents[@]}"
-          awk -F'\t' 'FILENAME == ARGV[1] { left[$1 FS $2]; next } !(($1 FS $2) in left)' "$dir/after" "$dir/before" > "$dir/fixed"
+          cp "$dir/before" "$dir/after"
+          # The crate itself, then the crates that depend on what is left.
+          mapfile -t crates < <(awk -F'\t' '$2 != "" { print $2 "@" $3 }' "$dir/after" | sort -u)
+          for p in "${crates[@]}"; do try "$p"; done
+          mapfile -t parents < <(cut -f4 "$dir/after" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+          for p in "${parents[@]}"; do try "$p"; done
+          awk -F'\t' 'FILENAME == ARGV[1] { left[$1 FS $2 FS $3]; next } !(($1 FS $2 FS $3) in left)' "$dir/after" "$dir/before" > "$dir/fixed"
           echo "Before:"; cat "$dir/before"; echo "After:"; cat "$dir/after"
           git diff --quiet -- Cargo.lock || echo changed=true >> "$GITHUB_OUTPUT"
 
@@ -111,6 +108,8 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
+          # The rebuilt branch can carry the target's own workflow changes.
+          permission-workflows: write
 
       - name: Open, update or close the pull request and the issue
         env:
@@ -121,6 +120,7 @@ jobs:
           set -euo pipefail
           dir="$RUNNER_TEMP/bump-advisories"
           label=cargo-advisories
+          title="cargo deny advisories on $TARGET"
           list() {
             awk -F'\t' '{ id = $1 ~ /^RUSTSEC-/ ? "[" $1 "](https://rustsec.org/advisories/" $1 ".html)" : $1
                           printf "- %s in `%s %s`: %s\n", id, $2, $3, $5 }' "$1"
@@ -133,15 +133,19 @@ jobs:
             if [ -n "$pr" ] && [ "$(gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)" = "$(git hash-object Cargo.lock)" ]; then
               echo "#$pr already holds this Cargo.lock"
             else
+              # ci.yml runs this line on a real runner.
+              # shellcheck disable=SC2016
+              helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
+              git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
               bot="${APP_SLUG}[bot]"
               git config user.name "$bot"
               git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
               subject="Bump crates with security advisories"
               fixed=$(list "$dir/fixed")
-              git checkout -B "$BRANCH"
+              git -c core.hooksPath=/dev/null checkout -B "$BRANCH"
               printf '%s\n\nFixes:\n%s\n' "$subject" "$fixed" | git -c core.hooksPath=/dev/null commit -F - -- Cargo.lock
               # Rebuilt from the target on every run that changes it.
-              git -c core.hooksPath=/dev/null push --force "https://x-access-token:$GH_TOKEN@${GITHUB_SERVER_URL#https://}/$REPO.git" "HEAD:refs/heads/$BRANCH"
+              git -c core.hooksPath=/dev/null push --force origin "HEAD:refs/heads/$BRANCH"
               body="Updates \`Cargo.lock\` on \`$TARGET\` past these \`cargo deny check advisories\` findings:
 
           $fixed
@@ -157,23 +161,31 @@ jobs:
             gh pr close "$pr" --delete-branch --comment "\`$TARGET\` no longer needs this update."
           fi
 
-          issue=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          issue=$(TITLE=$title gh issue list --label "$label" --state open --json number,title \
+                    --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')
           if [ -s "$dir/after" ]; then
             remaining=$(list "$dir/after")
-            body="\`cargo deny check advisories\` reports these on \`$TARGET\`, and updating \`Cargo.lock\` does not fix them. Raise a requirement in a \`Cargo.toml\`, or ignore the advisory in \`deny.toml\` with the reason.
+            body="\`cargo deny check advisories\` reports these on \`$TARGET\`, with the bump pull request applied if one is open. Updating \`Cargo.lock\` does not fix them. Raise a requirement in a \`Cargo.toml\`, or ignore the advisory in \`deny.toml\` with the reason.
 
           $remaining
 
           The \`$GITHUB_WORKFLOW\` workflow keeps this list current and closes this issue when it is empty."
             gh label create "$label" --force --color B60205 --description "cargo deny advisories that Cargo.lock updates cannot fix"
             if [ -z "$issue" ]; then
-              gh issue create --title "cargo deny advisories on $TARGET" --label "$label" --body "$body"
+              gh issue create --title "$title" --label "$label" --body "$body"
             else
               old=$(gh issue view "$issue" --json body --jq .body)
               if [ "$old" != "$body" ]; then
                 gh issue edit "$issue" --body "$body"
-                # An edit notifies nobody; a comment does.
-                if new=$(grep -vxF -f <(printf '%s\n' "$old") <<< "$remaining"); then
+                # An edit notifies nobody; a comment does. New means an
+                # advisory and crate the old list lacks.
+                # shellcheck disable=SC2016
+                key() { sed -nE 's/^- \[?([^] ]+)[^`]* in `([^ ]+) .*/\1 \2/p'; }
+                was=$(key <<< "$old")
+                new=$(while IFS= read -r l; do
+                        grep -qxF -- "$(key <<< "$l")" <<< "$was" || printf '%s\n' "$l"
+                      done <<< "$remaining")
+                if [ -n "$new" ]; then
                   gh issue comment "$issue" --body "New since the last run:
 
           $new"
