@@ -1126,7 +1126,7 @@ mb_commit mainnet "pr:9:dave" c -
 # or script that can see it is caught.
 cat > "$mb_tmp/step.py" <<'PYEOF'
 import re, sys, yaml
-wf, name, outputs, *inputs = sys.argv[1:]
+wf, name, outputs, script, *inputs = sys.argv[1:]
 d = yaml.safe_load(open(wf))
 st = next(x for x in d['jobs']['merge']['steps'] if x.get('name') == name)
 inputs = dict(i.split('=', 1) for i in inputs)
@@ -1147,16 +1147,12 @@ def holds(c):
 print('run' if 'if' not in st or holds(st['if']) else 'skip')
 for k, v in (st.get('env') or {}).items():
     print(k + '=' + re.sub(r'\$\{\{(.*?)\}\}', lambda m: ref(m[1]), str(v)))
-open(sys.argv[0][:-3] + '.sh', 'w').write(st['run'])
+open(script, 'w').write(st['run'])
 PYEOF
 mb_wf="$REPO/.github/workflows/merge-branches.yml"
-mb_persist=$(python3 -c "
-import yaml
-d = yaml.safe_load(open('$mb_wf'))
-print(next(x for x in d['jobs']['merge']['steps'] if 'checkout' in x.get('uses', ''))['with'].get('persist-credentials', True))")
 mb_step() { # step name -> its exit code; skipped when its condition is false
   local e rc
-  mapfile -t e < <(python3 "$mb_tmp/step.py" "$mb_wf" "$1" "$mb_tmp/outputs" ${MB_POST_MERGE:+"post-merge=$MB_POST_MERGE"})
+  mapfile -t e < <(python3 "$mb_tmp/step.py" "$mb_wf" "$1" "$mb_tmp/outputs" "$mb_tmp/step.sh" ${MB_POST_MERGE:+"post-merge=$MB_POST_MERGE"})
   case "${e[0]:-}" in run) ;; skip) return 0;; *) echo "step.py failed for $1"; return 98;; esac
   ( cd "$mb_tmp/work" || exit 99
     env "${e[@]:1}" PATH="$mb_tmp/bin:$PATH" MB_LOG="$mb_tmp/log" MB_PR="$MB_PR" MB_JQ_ARG="$mb_tmp/jq_arg" REPO=o/r \
@@ -1167,14 +1163,12 @@ mb_step() { # step name -> its exit code; skipped when its condition is false
 mb_run() { # source  open-pr-number-or-empty -> the job's exit code
   rm -rf "$mb_tmp/work" "$mb_tmp/runner"
   git clone -q --branch staging "$mb_tmp/origin.git" "$mb_tmp/work"
-  # What actions/checkout leaves behind unless told not to.
-  [ "$mb_persist" = False ] ||
-    git -C "$mb_tmp/work" config http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf x-access-token:tok-SECRET | base64)"
   mkdir "$mb_tmp/runner"
   : > "$mb_tmp/log"; : > "$mb_tmp/outputs"
-  { MB_SOURCE=$1 MB_PR=$2 mb_step "Merge the source without committing" &&
-    MB_SOURCE=$1 MB_PR=$2 mb_step "Run the post-merge script" &&
-    MB_SOURCE=$1 MB_PR=$2 mb_step "Commit, push, and open or update the pull request"; } > "$mb_tmp/out" 2>&1
+  local MB_SOURCE=$1 MB_PR=$2
+  { mb_step "Merge the source without committing" &&
+    mb_step "Run the post-merge script" &&
+    mb_step "Commit, push, and open or update the pull request"; } > "$mb_tmp/out" 2>&1
   echo "$?"
 }
 mb_order() { grep -oE '^(push|gh (label create|pr create|pr edit|pr ready|pr comment))' "$mb_tmp/log" | tr '\n' '|'; }
@@ -1304,7 +1298,17 @@ ck "resolves all: the job succeeds" \
    "$(mb_hook all '' 'git checkout -q --ours pinned locked && git add pinned locked')" "0"
 ck "resolves all: given the conflicts" "$(tr '\n' ' ' < "$mb_tmp/hook-args")" "locked pinned "
 ck "resolves all: sees no token"       "$(cat "$mb_tmp/hook-seen")" "0"
-ck "resolves all: no token persisted"  "$(git -C "$mb_tmp/work" config --get-regexp extraheader | wc -l)" "0"
+ck "checkout keeps no credentials" "$(python3 -c "
+import yaml
+d = yaml.safe_load(open('$mb_wf'))
+print(next(x for x in d['jobs']['merge']['steps'] if 'checkout' in x.get('uses', ''))['with'].get('persist-credentials'))")" "False"
+# What git would send to GitHub, from the helper the merge step installed.
+mb_cred() {
+  printf 'protocol=https\nhost=github.com\n\n' |
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false git -C "$mb_tmp/work" credential fill 2>/dev/null | grep -c '^password=tok-SECRET$'
+}
+ck "resolves all: git has the token where GH_TOKEN is set" "$(GH_TOKEN=tok-SECRET mb_cred)" "1"
+ck "resolves all: and not where it is not" "$(unset GH_TOKEN; mb_cred)" "0"
 ck "resolves all: pushes, then opens"  "$(mb_order)" "push|gh pr create|"
 ck "resolves all: not a draft"         "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
 ck "resolves all: keeps staging's pin" "$(mb_file all pinned)" "staging"
