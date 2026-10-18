@@ -23,3 +23,27 @@ jobs:
         run: ./lint-workflow-shell.sh
       - name: Tests
         run: ./test.sh
+
+  # The credential helper merge-branches.yml installs, on a real runner, with a
+  # checkout like its own. GitHub refuses a push from this read-only token with
+  # 403 only once git has sent it; without the token, git has nothing to send.
+  credential-helper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false, filter: blob:none, fetch-depth: 0 }
+      - name: Push with and without the token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          helper=
+          eval "$(grep -m1 -E "^ *helper='" .github/workflows/merge-branches.yml)"
+          [ -n "$helper" ] || { echo "::error::no helper line in merge-branches.yml"; exit 1; }
+          git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
+          probe() { GIT_TERMINAL_PROMPT=0 git push --dry-run origin HEAD:refs/heads/ci/credential-probe 2>&1; }
+          with=$(probe)
+          without=$(unset GH_TOKEN; probe)
+          printf 'with the token:\n%s\n\nwithout:\n%s\n' "$with" "$without"
+          grep -q 403 <<< "$with" || { echo "::error::git did not send the token"; exit 1; }
+          grep -q 'could not read Username' <<< "$without" || { echo "::error::git found credentials without the token"; exit 1; }

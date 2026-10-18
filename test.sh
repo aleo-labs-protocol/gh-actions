@@ -1268,7 +1268,9 @@ mkdir -p "$mb_tmp/seed/.github"
 cat > "$mb_tmp/seed/.github/post-merge" <<'HOOK'
 #!/bin/bash
 printf '%s\n' "$@" > "$MB_HOOK_ARGS"
-{ env; git config --list; } | grep -c -e tok-SECRET -e extraheader > "$MB_HOOK_SEEN"
+{ env; git config --list
+  printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false git credential fill 2>/dev/null
+} | grep -c tok-SECRET > "$MB_HOOK_SEEN"
 eval "${MB_HOOK:-}"
 HOOK
 chmod +x "$mb_tmp/seed/.github/post-merge"
@@ -1289,7 +1291,7 @@ mb_body() { sed -n '/^gh pr \(create\|comment\)/,/^gh /p' "$mb_tmp/log"; }
 mb_file() { git -C "$mb_tmp/origin.git" show "$(mb_tip "$1"):$2"; }
 
 mb_source all; mb_commit all "pr:20:lee" pinned all; mb_commit all "pr:20:lee" locked all
-ck "no input: the script does not run" "$(rm -f "$mb_tmp/hook-args"; MB_HOOK_ARGS="$mb_tmp/hook-args" MB_HOOK_SEEN=/dev/null mb_run all ''; [ -e "$mb_tmp/hook-args" ]; echo "$?")" "0
+ck "no input: the script does not run" "$(rm -f "$mb_tmp/hook-args"; MB_HOOK_ARGS="$mb_tmp/hook-args" MB_HOOK_SEEN=/dev/null mb_run all ''; if [ -e "$mb_tmp/hook-args" ]; then echo 0; else echo 1; fi)" "0
 1"
 ck "no input: a draft, as before"      "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
 git -C "$mb_tmp/origin.git" update-ref -d refs/heads/ci/merge-all-into-staging
@@ -1316,7 +1318,7 @@ ck "resolves all: the commit names them" "$(mb_msg all | sed -n '/^Changed by `.
    "Changed by \`.github/post-merge\`:|    locked|    pinned|"
 ck "resolves all: the body names them" "$(mb_body | grep -c -e '^- `locked`$' -e '^- `pinned`$' -e 'Changed by `.github/post-merge`:')" "3"
 
-ck "rerun: the script does not run"   "$(mb_hook all 42 'exit 1'; [ -e "$mb_tmp/hook-args" ]; echo "$?")" "0
+ck "rerun: the script does not run"   "$(mb_hook all 42 'exit 1'; if [ -e "$mb_tmp/hook-args" ]; then echo 0; else echo 1; fi)" "0
 1"
 
 mb_source some; mb_commit some "pr:21:max" pinned some; mb_commit some "pr:21:max" locked some
@@ -1347,7 +1349,7 @@ ck "fails: the job fails"              "$(mb_hook fails '' 'exit 3')" "1"
 ck "fails: says so"                    "$(grep -c '::error::post-merge: .github/post-merge failed' "$mb_tmp/out")" "1"
 ck "fails: nothing pushed or opened"   "$(cat "$mb_tmp/log")" ""
 ck "commits: the job fails"            "$(mb_hook fails '' 'git add -A && git commit -q -m x')" "1"
-ck "commits: says so"                  "$(grep -c 'committed or aborted the merge' "$mb_tmp/out")" "1"
+ck "commits: says so"                  "$(grep -c 'committed, aborted or replaced the merge' "$mb_tmp/out")" "1"
 ck "commits: nothing pushed or opened" "$(cat "$mb_tmp/log")" ""
 
 ck "missing: the job fails" \
@@ -1359,11 +1361,23 @@ mb_git checkout -q staging; cp "$mb_tmp/seed/.github/post-merge" "$mb_tmp/seed/.
 mb_git add .github/plain; mb_git commit -q -m plain; mb_git push -q origin staging
 ck "not executable: the job fails"     "$(MB_POST_MERGE=.github/plain mb_run fails '')" "1"
 
-# Staged as git left them: no longer unmerged, the same tree, still named.
+# Staged with its markers: no longer unmerged, but not resolved.
 mb_source added; mb_commit added "pr:26:rio" pinned added
-ck "stages as is: the job succeeds"     "$(mb_hook added '' 'git add pinned')" "0"
-ck "stages as is: still named"          "$(mb_msg added | sed -n '/^Changed by/,$p' | tr '\n' '|')" \
-   "Changed by \`.github/post-merge\`:|    pinned|"
+ck "stages markers: the job succeeds"   "$(mb_hook added '' 'git add pinned')" "0"
+ck "stages markers: a draft"            "$(grep -c -- '--draft --label merge-conflict' "$mb_tmp/log")" "1"
+ck "stages markers: the commit" "$(mb_msg added | sed -n '/^Changed by/,$p;/^Committed with/,$p' | tr '\n' '|')" \
+   "Committed with these paths unresolved:|    pinned|"
+
+mb_source githooks; mb_commit githooks "pr:29:uma" pinned githooks
+ck "installs git hooks: the job succeeds" "$(mb_hook githooks '' 'for h in pre-push post-commit; do
+    printf "#!/bin/sh\necho %s >> %s\n" "$h" "$MB_HOOK_ARGS.githooks" > ".git/hooks/$h"; chmod +x ".git/hooks/$h"
+  done; git checkout -q --ours pinned && git add pinned')" "0"
+ck "installs git hooks: none run"       "$(cat "$mb_tmp/hook-args.githooks" 2>/dev/null)" ""
+
+mb_source moves; mb_commit moves "pr:30:val" pinned moves
+ck "moves HEAD: the job fails"          "$(mb_hook moves '' 'git update-ref HEAD HEAD^')" "1"
+ck "moves HEAD: says so"                "$(grep -c 'committed, aborted or replaced the merge' "$mb_tmp/out")" "1"
+ck "moves HEAD: nothing pushed or opened" "$(cat "$mb_tmp/log")" ""
 
 # Someone replaced the script on the open pull request's branch; staging's runs.
 mb_hook all 42 'exit 0' >/dev/null
@@ -1371,6 +1385,19 @@ mb_human all .github/post-merge 'exit 7' >/dev/null
 mb_commit all "pr:25:quinn" a all
 ck "from the target: the job succeeds" "$(mb_hook all 42 ':')" "0"
 ck "from the target: staging's ran"    "$(cat "$mb_tmp/hook-seen")" "0"
+
+# The source edits a file staging deletes: a conflict without markers, kept
+# by staging it. The name is not ASCII, which git quotes by default.
+mb_git checkout -q staging; echo base > "$mb_tmp/seed/gône"; mb_git add gône; mb_git commit -q -m gône; mb_git push -q origin staging
+mb_git checkout -q -b gone staging; mb_git push -q origin gone
+mb_commit gone "pr:27:sam" gône kept
+mb_commit staging "drop gône" gône -
+ck "modify/delete: the job succeeds"    "$(mb_hook gone '' 'git add gône')" "0"
+ck "modify/delete: given the name"      "$(cat "$mb_tmp/hook-args")" "gône"
+ck "modify/delete: not a draft"         "$(grep -c -- '--draft' "$mb_tmp/log")" "0"
+ck "modify/delete: named"               "$(mb_msg gone | sed -n '/^Changed by/,$p' | tr '\n' '|')" \
+   "Changed by \`.github/post-merge\`:|    gône|"
+ck "modify/delete: kept"                "$(mb_file gone gône)" "kept"
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$mb_tmp"
 

@@ -138,9 +138,12 @@ jobs:
           # The token is read when git asks, so git authenticates only in a step
           # whose env has GH_TOKEN: the partial clone's fetches here, and the
           # push. The config holds no token.
+          # ci.yml runs this line on a real runner.
           # shellcheck disable=SC2016
-          git config "credential.$GITHUB_SERVER_URL.helper" \
-            '!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
+          helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
+          git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
+          # Paths reach the post-merge script and the pull request unquoted.
+          git config core.quotePath false
 
           bot="${APP_SLUG}[bot]"
           git config user.name "$bot"
@@ -188,6 +191,7 @@ jobs:
             echo "::error::git merge failed without reporting a conflict" >&2
             exit 1
           fi
+          git rev-parse HEAD MERGE_HEAD > "$dir/heads"
           if [ -n "$POST_MERGE" ]; then
             # The tree the commit would hold without the post-merge script, so
             # the push step can name what the script changed.
@@ -210,8 +214,8 @@ jobs:
             echo "::error::post-merge: $POST_MERGE failed" >&2
             exit 1
           fi
-          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-            echo "::error::post-merge: $POST_MERGE committed or aborted the merge" >&2
+          if ! { git rev-parse -q --verify HEAD; git rev-parse -q --verify MERGE_HEAD; } | cmp -s - "$RUNNER_TEMP/merge-branches/heads"; then
+            echo "::error::post-merge: $POST_MERGE committed, aborted or replaced the merge" >&2
             exit 1
           fi
 
@@ -236,8 +240,16 @@ jobs:
           # recorded before staging.
           mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
           if [ -n "$POST_MERGE" ]; then
-            # What the post-merge script resolved without editing.
-            LC_ALL=C comm -23 "$dir/conflicts" <(printf '%s\n' "${conflicts[@]}") > "$dir/resolved"
+            # What the post-merge script resolved without editing. A path it
+            # staged with markers still in it is not resolved.
+            : > "$dir/resolved"
+            while IFS= read -r path; do
+              if [ -f "$path" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "./$path"; then
+                conflicts+=("$path")
+              else
+                echo "$path" >> "$dir/resolved"
+              fi
+            done < <(LC_ALL=C comm -23 "$dir/conflicts" <(printf '%s\n' "${conflicts[@]}"))
           fi
           git add -A
           changed=()
@@ -266,7 +278,7 @@ jobs:
               printf '\nCommitted with these paths unresolved:\n'
               printf '    %s\n' "${conflicts[@]}"
             fi
-          } | git commit --no-verify -F -
+          } | git -c core.hooksPath=/dev/null commit -F -
           if [ "${#conflicts[@]}" != 0 ]; then
             # Gated before the push: once the branch carries the source, the
             # next run has nothing to redo.
@@ -290,7 +302,8 @@ jobs:
           if [ -n "$LEASE" ]; then
             force=(--force-with-lease="$LEASE")
           fi
-          git push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
+          # No hook the post-merge script may have installed runs with the token.
+          git -c core.hooksPath=/dev/null push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
 
           summary="Merges $(wc -l <<< "$new_commits") new commit(s) from \`$SOURCE\` at ${src:0:9}.$note$warning"
           if [ -n "$pr" ]; then
