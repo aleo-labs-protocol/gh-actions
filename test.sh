@@ -1401,6 +1401,168 @@ ck "modify/delete: kept"                "$(mb_file gone gône)" "kept"
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$mb_tmp"
 
+echo "== bump-advisories: updating the crates =="
+ba_tmp="$(mktemp -d)"; mkdir -p "$ba_tmp/bin"
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$ba_tmp/gitconfig"
+git config -f "$GIT_CONFIG_GLOBAL" user.name test
+git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
+git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch staging
+# The URL the step pushes to, sent to a local remote.
+git config -f "$GIT_CONFIG_GLOBAL" "url.$ba_tmp/origin.git.insteadOf" "https://x-access-token:tok-SECRET@github.com/o/r.git"
+# Each step's own run block, with the env its YAML and the workflow's give it.
+cat > "$ba_tmp/step.py" <<'PYEOF'
+import os, re, sys, yaml
+wf, name, script = sys.argv[1:]
+d = yaml.safe_load(open(wf))
+st = next(x for x in d['jobs']['bump']['steps'] if x.get('name') == name)
+vals = {'github.repository': 'o/r', 'inputs.target': 'staging', 'steps.app.outputs.token': 'tok-SECRET',
+        'steps.app.outputs.app-slug': 'merge-bot', 'steps.bump.outputs.changed': os.environ.get('BA_CHANGED', '')}
+def ref(m):
+    r = m[1].strip()
+    if r not in vals: sys.exit('unknown expression: ' + r)
+    return vals[r]
+for k, v in {**d['env'], **(st.get('env') or {})}.items():
+    print(k + '=' + re.sub(r'\$\{\{(.*?)\}\}', ref, str(v)))
+open(script, 'w').write(st['run'])
+PYEOF
+ba_step() { # step name, env assignments -> its exit code
+  local name=$1 e; shift
+  mapfile -t e < <(python3 "$ba_tmp/step.py" "$REPO/.github/workflows/bump-advisories.yml" "$name" "$ba_tmp/step.sh")
+  (( ${#e[@]} )) || return 98
+  ( cd "$ba_tmp/work" || exit 99
+    env "${e[@]}" "$@" PATH="$ba_tmp/bin:$PATH" BA_LOG="$ba_tmp/log" BA_TMP="$ba_tmp" \
+      GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=1 GITHUB_WORKFLOW=w \
+      RUNNER_TEMP="$ba_tmp/runner" GITHUB_OUTPUT="$ba_tmp/outputs" bash "$ba_tmp/step.sh" ) >> "$ba_tmp/out" 2>&1
+}
+# Three advisories on zip 8.6.0, which self_update pins, shaped as cargo-deny
+# 0.20.2 reports them, after a log line and a warning that are not findings.
+# `cargo update -p "$BA_FIX"` clears them; every `cargo update -p` changes
+# Cargo.lock.
+cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
+#!/bin/bash
+case "$*" in
+  "update -p "*) echo "$3" | tee -a "$BA_LOG" >> Cargo.lock;;
+  "deny --format json check advisories")
+    [ -n "${BA_BROKEN:-}" ] && { echo "error: failed to fetch the advisory database" >&2; exit 1; }
+    echo '{"type":"log","fields":{"level":"INFO","message":"fetching"}}' >&2
+    echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"not encountered"}}' >&2
+    [ -n "${BA_CLEAN:-}" ] && exit 0
+    # Never fixed: on foo 1.0.0, which bar pins.
+    [ -n "${BA_MIXED:-}" ] && jq -cn '{type: "diagnostic", fields: {severity: "error", code: "unmaintained",
+      message: "foo", advisory: {id: "RUSTSEC-2026-0001", package: "foo", title: "foo"},
+      graphs: [{Krate: {name: "foo", version: "1.0.0"}, parents: [{Krate: {name: "bar", version: "2.0.0"}}]}]}}' >&2
+    grep -qxF "${BA_FIX:-}" Cargo.lock && exit "$([ -n "${BA_MIXED:-}" ] && echo 1 || echo 0)"
+    for n in 7 8 9; do
+      jq -cn --arg id "RUSTSEC-2026-036$n" '{type: "diagnostic", fields: {severity: "error", code: "vulnerability",
+        message: " title \($id) ", advisory: {id: $id, package: "zip", title: " title \($id) "},
+        graphs: [{Krate: {name: "zip", version: "8.6.0"}, parents: [{Krate: {name: "self_update", version: "1.3.0"}}]}]}}' >&2
+    done
+    exit 1;;
+  *) echo "unexpected: cargo $*" >&2; exit 1;;
+esac
+CARGOEOF
+chmod +x "$ba_tmp/bin/cargo"
+git init -q --bare "$ba_tmp/origin.git"
+printf '#!/bin/sh\necho push >> %q\n' "$ba_tmp/log" > "$ba_tmp/origin.git/hooks/pre-receive"
+chmod +x "$ba_tmp/origin.git/hooks/pre-receive"
+git init -q "$ba_tmp/seed"
+echo lock > "$ba_tmp/seed/Cargo.lock"
+git -C "$ba_tmp/seed" add Cargo.lock; git -C "$ba_tmp/seed" commit -q -m base
+git -C "$ba_tmp/seed" push -q "$ba_tmp/origin.git" staging
+ba_bump() { # env assignments -> the step's exit code
+  rm -rf "$ba_tmp/work" "$ba_tmp/runner"; mkdir "$ba_tmp/runner"
+  git clone -q --branch staging "$ba_tmp/origin.git" "$ba_tmp/work"
+  : > "$ba_tmp/log"; : > "$ba_tmp/outputs"; : > "$ba_tmp/out"
+  ba_step "Update the crates with advisories" "$@"
+  echo "$?"
+}
+ba_ids() { cut -f1 "$ba_tmp/runner/bump-advisories/$1" | tr '\n' ' '; }
+ba_all="RUSTSEC-2026-0367 RUSTSEC-2026-0368 RUSTSEC-2026-0369 "
+ck "clean: the step succeeds"        "$(ba_bump BA_CLEAN=1)" "0"
+ck "clean: nothing updated"          "$(cat "$ba_tmp/log")" ""
+ck "parent fix: the step succeeds"   "$(ba_bump BA_FIX=self_update@1.3.0)" "0"
+ck "parent fix: crate, then parent"  "$(tr '\n' ' ' < "$ba_tmp/log")" "zip@8.6.0 self_update@1.3.0 "
+ck "parent fix: all fixed"           "$(ba_ids fixed)" "$ba_all"
+ck "parent fix: none left"           "$(ba_ids after)" ""
+ck "parent fix: Cargo.lock changed"  "$(cat "$ba_tmp/outputs")" "changed=true"
+ck "crate fix: the step succeeds"    "$(ba_bump BA_FIX=zip@8.6.0)" "0"
+ck "crate fix: parents untouched"    "$(tr '\n' ' ' < "$ba_tmp/log")" "zip@8.6.0 "
+ck "unfixable: the step succeeds"    "$(ba_bump BA_FIX=nothing)" "0"
+ck "unfixable: none fixed"           "$(ba_ids fixed)" ""
+ck "unfixable: all left"             "$(ba_ids after)" "$ba_all"
+ck "unfixable: Cargo.lock unchanged" "$(cat "$ba_tmp/outputs")" ""
+ck "mixed: the step succeeds"        "$(ba_bump BA_FIX=zip@8.6.0 BA_MIXED=1)" "0"
+ck "mixed: zip fixed"                "$(ba_ids fixed)" "$ba_all"
+ck "mixed: foo left"                 "$(ba_ids after)" "RUSTSEC-2026-0001 "
+ck "mixed: the parent pass undone"   "$(tr '\n' ' ' < "$ba_tmp/log"; tr '\n' ' ' < "$ba_tmp/work/Cargo.lock")" \
+   "foo@1.0.0 zip@8.6.0 bar@2.0.0 lock foo@1.0.0 zip@8.6.0 "
+ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
+ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
+
+echo "== bump-advisories: the pull request and the issue =="
+# BA_PR and BA_ISSUE are the open pull request and issue, BA_SHA the blob the
+# pull request's branch holds as Cargo.lock, BA_OLD the issue's body. Writes
+# are logged, and each --body is kept as body.<command>.
+cat > "$ba_tmp/bin/gh" <<'GHEOF'
+#!/bin/bash
+[ "${GH_TOKEN:-}" = tok-SECRET ] || { echo "gh without the app token: gh $*" >&2; exit 1; }
+jq_arg() { local prev=; for a in "$@"; do [ "$prev" = --jq ] && { echo "$a"; return; }; prev=$a; done; }
+case "$*" in
+  "pr list --head ci/bump-advisories-into-staging --base staging "*)
+    jq -n --arg n "${BA_PR:-}" '[{number: 99, isCrossRepository: true}] + [$n | select(. != "") | {number: tonumber, isCrossRepository: false}]' \
+      | jq -r "$(jq_arg "$@")";;
+  "api repos/o/r/contents/Cargo.lock?ref=ci/bump-advisories-into-staging "*) echo "${BA_SHA:-}";;
+  "api users/"*) echo 12345;;
+  "issue list --label cargo-advisories "*) echo "${BA_ISSUE:-}";;
+  "issue view"*) cat "$BA_OLD";;
+  "pr create"*|"pr edit"*|"pr close"*|"label create"*|"issue create"*|"issue edit"*|"issue comment"*|"issue close"*)
+    echo "gh $1 $2" >> "$BA_LOG"
+    prev=; for a in "$@"; do [ "$prev" = --body ] && printf '%s\n' "$a" > "$BA_TMP/body.$1-$2"; prev=$a; done;;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$ba_tmp/bin/gh"
+ba_publish() { # env assignments -> the step's exit code
+  : > "$ba_tmp/log"; rm -f "$ba_tmp"/body.*
+  BA_CHANGED="$(sed -n 's/^changed=//p' "$ba_tmp/outputs")" \
+    ba_step "Open, update or close the pull request and the issue" "$@"
+  echo "$?"
+}
+ba_log() { tr '\n' '|' < "$ba_tmp/log"; }
+ba_branch() { git -C "$ba_tmp/origin.git" show "ci/bump-advisories-into-staging:$1"; }
+ba_bump BA_FIX=self_update@1.3.0 >/dev/null
+ck "fixed: the step succeeds"        "$(ba_publish)" "0"
+ck "fixed: pushes, then opens"       "$(ba_log)" "push|gh pr create|"
+ck "fixed: the branch holds the fix" "$(ba_branch Cargo.lock | tail -1)" "self_update@1.3.0"
+ck "fixed: the body names them"      "$(grep -c '^- \[RUSTSEC-2026-036[789]\](https://rustsec.org/advisories/RUSTSEC-2026-036[789].html) in `zip 8.6.0`: title RUSTSEC' "$ba_tmp/body.pr-create")" "3"
+ck "fixed: so does the commit"       "$(git -C "$ba_tmp/origin.git" log -1 --format=%B ci/bump-advisories-into-staging | grep -c '^- \[RUSTSEC')" "3"
+# Each run starts from a fresh checkout, as on a runner.
+ba_fixed() { ba_bump BA_FIX=self_update@1.3.0 >/dev/null; git -C "$ba_tmp/work" hash-object Cargo.lock; }
+ck "same lock: does nothing"         "$(ba_publish BA_PR=5 BA_SHA="$(ba_fixed)")$(ba_log)" "0"
+ba_fixed >/dev/null
+git -C "$ba_tmp/origin.git" update-ref -d refs/heads/ci/bump-advisories-into-staging
+ck "new lock: pushes, then edits"    "$(ba_publish BA_PR=5 BA_SHA=0123)$(ba_log)" "0push|gh pr edit|"
+ba_fixed >/dev/null
+git -C "$ba_tmp/origin.git" update-ref -d refs/heads/ci/bump-advisories-into-staging
+ck "a fork's pull request is not ours" "$(ba_publish)$(ba_log)" "0push|gh pr create|"
+
+ba_bump BA_FIX=nothing >/dev/null
+ck "unfixable: closes, then opens an issue" "$(ba_publish BA_PR=5)$(ba_log)" "0gh pr close|gh label create|gh issue create|"
+ck "unfixable: the issue names them" "$(grep -c '^- \[RUSTSEC' "$ba_tmp/body.issue-create")" "3"
+cp "$ba_tmp/body.issue-create" "$ba_tmp/issue"
+cp "$ba_tmp/issue" "$ba_tmp/old"
+ck "same issue: no edit"             "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old")$(ba_log)" "0gh label create|"
+grep -v 0369 "$ba_tmp/issue" > "$ba_tmp/old"
+ck "a new one: edits, and comments"  "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old")$(ba_log)" "0gh label create|gh issue edit|gh issue comment|"
+ck "the comment names only it"       "$(grep -c '^- \[RUSTSEC-2026-0369\]' "$ba_tmp/body.issue-comment"); $(grep -c '^- ' "$ba_tmp/body.issue-comment")" "1; 1"
+
+ba_bump BA_CLEAN=1 >/dev/null
+ck "clean: closes both"              "$(ba_publish BA_PR=5 BA_ISSUE=3)$(ba_log)" "0gh pr close|gh issue close|"
+ck "clean: neither, nothing"         "$(ba_publish)$(ba_log)" "0"
+
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+rm -rf "$ba_tmp"
+
 rm -rf "$no_aws"
 echo
 echo "  ${pass} passed, ${fail} failed"

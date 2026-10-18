@@ -1,0 +1,185 @@
+# Keeps one pull request open that updates Cargo.lock past the crates
+# `cargo deny check advisories` reports, and one issue listing the advisories
+# such an update cannot fix.
+#
+# Usage and setup: "Bumping crates with advisories" in README.md.
+name: bump-advisories
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: The branch to check, and that the pull request merges into.
+        type: string
+        required: true
+      cargo-deny:
+        description: The cargo-deny release to run.
+        type: string
+        default: 0.20.2
+    secrets:
+      # Not required: the caller's job has no environment, so the value it
+      # passes is empty. This job sets the environment and receives its value.
+      MERGE_BOT_APP_KEY:
+        required: false
+
+permissions: {}
+
+env:
+  REPO: ${{ github.repository }}
+  TARGET: ${{ inputs.target }}
+  BRANCH: ci/bump-advisories-into-${{ inputs.target }}
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # The caller's environment, which admits only runs on the target branch.
+    environment: merge-bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.target }}
+          persist-credentials: false
+
+      - name: Install cargo-deny and the toolchain
+        env:
+          VERSION: ${{ inputs.cargo-deny }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$VERSION/cargo-deny-$VERSION-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" --strip-components=1 --wildcards '*/cargo-deny'
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          rustup toolchain install --profile minimal
+
+      # Runs before the app token exists.
+      - name: Update the crates with advisories
+        id: bump
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/bump-advisories"
+          mkdir -p "$dir"
+          # One line per error: advisory, crate, version, the crates that
+          # depend on it, title.
+          findings() {
+            local rc=0
+            cargo deny --format json check advisories 2> "$dir/deny.json" > /dev/null || rc=$?
+            jq -Rr 'fromjson? | select(.type == "diagnostic" and .fields.severity == "error") | .fields as $f
+                    | ($f.graphs[0] // {}) as $g
+                    | [$f.advisory.id // $f.code, $g.Krate.name // "", $g.Krate.version // "",
+                       ([$g.parents[]?.Krate | "\(.name)@\(.version)"] | join(" ")),
+                       ($f.advisory.title // $f.message | gsub("^\\s+|\\s+$"; ""))] | @tsv' \
+              "$dir/deny.json" > "$dir/$1"
+            if [ "$rc" != 0 ] && [ ! -s "$dir/$1" ]; then
+              cat "$dir/deny.json" >&2
+              echo "::error::cargo deny failed without reporting an advisory" >&2
+              exit 1
+            fi
+          }
+          update() {
+            for p in "$@"; do
+              cargo update -p "$p" || echo "::warning::cargo update -p $p failed"
+            done
+          }
+          keys() { cut -f1,2 "$dir/$1" | sort -u; }
+          # A pass that clears no finding is undone, so its updates do not
+          # ride along in the pull request.
+          pass() { # findings after it, findings before it, crates to update
+            local now=$1 prev=$2
+            shift 2
+            cp Cargo.lock "$dir/Cargo.lock"
+            update "$@"
+            findings "$now"
+            if [ -z "$(comm -23 <(keys "$prev") <(keys "$now"))" ]; then
+              cp "$dir/Cargo.lock" Cargo.lock
+              cp "$dir/$prev" "$dir/$now"
+            fi
+          }
+          findings before
+          # The crate itself, then, for what that left, the crates that pin it.
+          mapfile -t crates < <(awk -F'\t' '$2 != "" { print $2 "@" $3 }' "$dir/before" | sort -u)
+          pass crates before "${crates[@]}"
+          mapfile -t parents < <(cut -f4 "$dir/crates" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+          pass after crates "${parents[@]}"
+          awk -F'\t' 'FILENAME == ARGV[1] { left[$1 FS $2]; next } !(($1 FS $2) in left)' "$dir/after" "$dir/before" > "$dir/fixed"
+          echo "Before:"; cat "$dir/before"; echo "After:"; cat "$dir/after"
+          git diff --quiet -- Cargo.lock || echo changed=true >> "$GITHUB_OUTPUT"
+
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Open, update or close the pull request and the issue
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          CHANGED: ${{ steps.bump.outputs.changed }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/bump-advisories"
+          label=cargo-advisories
+          list() {
+            awk -F'\t' '{ id = $1 ~ /^RUSTSEC-/ ? "[" $1 "](https://rustsec.org/advisories/" $1 ".html)" : $1
+                          printf "- %s in `%s %s`: %s\n", id, $2, $3, $5 }' "$1"
+          }
+
+          # --head matches a fork's branch of the same name too.
+          pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
+                 --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
+          if [ "$CHANGED" = true ]; then
+            if [ -n "$pr" ] && [ "$(gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)" = "$(git hash-object Cargo.lock)" ]; then
+              echo "#$pr already holds this Cargo.lock"
+            else
+              bot="${APP_SLUG}[bot]"
+              git config user.name "$bot"
+              git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
+              subject="Bump crates with security advisories"
+              fixed=$(list "$dir/fixed")
+              git checkout -B "$BRANCH"
+              printf '%s\n\nFixes:\n%s\n' "$subject" "$fixed" | git -c core.hooksPath=/dev/null commit -F - -- Cargo.lock
+              # Rebuilt from the target on every run that changes it.
+              git -c core.hooksPath=/dev/null push --force "https://x-access-token:$GH_TOKEN@${GITHUB_SERVER_URL#https://}/$REPO.git" "HEAD:refs/heads/$BRANCH"
+              body="Updates \`Cargo.lock\` on \`$TARGET\` past these \`cargo deny check advisories\` findings:
+
+          $fixed
+
+          Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow. Each run that changes the result rebuilds this branch from \`$TARGET\` and force-pushes it, so do not push to it."
+              if [ -n "$pr" ]; then
+                gh pr edit "$pr" --body "$body"
+              else
+                gh pr create --head "$BRANCH" --base "$TARGET" --title "$subject" --body "$body"
+              fi
+            fi
+          elif [ -n "$pr" ]; then
+            gh pr close "$pr" --delete-branch --comment "\`$TARGET\` no longer needs this update."
+          fi
+
+          issue=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ -s "$dir/after" ]; then
+            remaining=$(list "$dir/after")
+            body="\`cargo deny check advisories\` reports these on \`$TARGET\`, and updating \`Cargo.lock\` does not fix them. Raise a requirement in a \`Cargo.toml\`, or ignore the advisory in \`deny.toml\` with the reason.
+
+          $remaining
+
+          The \`$GITHUB_WORKFLOW\` workflow keeps this list current and closes this issue when it is empty."
+            gh label create "$label" --force --color B60205 --description "cargo deny advisories that Cargo.lock updates cannot fix"
+            if [ -z "$issue" ]; then
+              gh issue create --title "cargo deny advisories on $TARGET" --label "$label" --body "$body"
+            else
+              old=$(gh issue view "$issue" --json body --jq .body)
+              if [ "$old" != "$body" ]; then
+                gh issue edit "$issue" --body "$body"
+                # An edit notifies nobody; a comment does.
+                if new=$(grep -vxF -f <(printf '%s\n' "$old") <<< "$remaining"); then
+                  gh issue comment "$issue" --body "New since the last run:
+
+          $new"
+                fi
+              fi
+            fi
+          elif [ -n "$issue" ]; then
+            gh issue close "$issue" --comment "No advisory is left that updating \`Cargo.lock\` cannot fix."
+          fi
