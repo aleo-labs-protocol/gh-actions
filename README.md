@@ -188,6 +188,43 @@ A bot push to a pull request keeps approvals given before it, unless the
 target's rules dismiss stale approvals or require approval of the most recent
 push.
 
+### Resolving a repository's own conflicts
+
+A caller can name a script that runs after every merge, before the commit:
+
+```yaml
+    with:
+      target: staging
+      sources: testnet mainnet
+      post-merge: .github/merge-fixup.sh
+```
+
+- The merge runs as `git merge --no-ff --no-commit`, also when it is clean.
+  The script then runs from the repository root with the merge in progress.
+- Its arguments are the unmerged paths, possibly none. `TARGET` and `SOURCE`
+  hold the branch names.
+- It may edit files and `git add` them. It must not commit or abort the merge.
+  Everything it leaves in the working tree is committed, untracked files too.
+- If it fails, or leaves no merge in progress, the job fails and nothing is
+  pushed. A missing or non-executable script fails the job too.
+- Paths still unmerged after it are committed with their markers, as above,
+  and the pull request is a draft. If none are left, it is not.
+- The commit message and the pull request name every path the script edited
+  or resolved, so reviewers know where to look. This includes an edit to a
+  cleanly merged file, such as a dependency pin the source moved.
+
+The script is read from the target branch, never from the source or the pull
+request's branch. Those take pushes without review, and the target is
+protected. That protection is what makes the script trusted.
+
+The script runs in a step with no token, and the checkout keeps no
+credentials. The step before it and the push after it are given the token in
+their own env. This is not a sandbox: the script shares the runner and the
+checkout with the push step. It keeps the token out of reach of a script that
+misbehaves, not one written to attack. Without credentials, the script cannot
+fetch objects the merge did not, so in a private repository it should read
+only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
+
 ## Versioning
 
 Callers pin a major tag, currently `@v2`. The AWS role trusts `start-runner.yml` **only at a `v*` tag**

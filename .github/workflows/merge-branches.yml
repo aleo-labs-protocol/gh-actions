@@ -1,6 +1,7 @@
 # Keeps one pull request open from each source branch into the target while the
 # source has commits the target lacks. Conflicts are committed with their
 # markers, labelled, and the pull request is a draft until people resolve them.
+# A caller's post-merge script can resolve its own conflicts first.
 #
 # Usage and setup: "Merging branches" in README.md.
 name: merge-branches
@@ -16,6 +17,12 @@ on:
         description: Space-separated branches to merge into the target.
         type: string
         required: true
+      post-merge:
+        description: >-
+          An executable on the target branch, as a path from the repository
+          root, that runs after each merge and before its commit. See README.md.
+        type: string
+        default: ''
     secrets:
       # Not required: the caller's job has no environment, so the value it
       # passes is empty. The merge job sets the environment and receives the
@@ -110,24 +117,35 @@ jobs:
           permission-issues: write
           permission-workflows: write
 
+      # Keeps no credentials, so the post-merge step has none to read. The
+      # steps that need the token are given it in their env.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.target }}
           fetch-depth: 0
           filter: blob:none
           token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
 
-      - name: Merge and open or update the pull request
+      - name: Merge the source without committing
+        id: merge
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          POST_MERGE: ${{ inputs.post-merge }}
         run: |
           set -euo pipefail
+          # The checkout kept no credentials. These let the partial clone fetch
+          # the blobs this merge needs, in this step only.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader" \
+                 GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+
           bot="${APP_SLUG}[bot]"
           git config user.name "$bot"
           git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
 
-          label=merge-conflict
           src=$(git rev-parse "origin/$SOURCE")
           # --head matches a fork's branch of the same name too.
           pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
@@ -136,39 +154,119 @@ jobs:
             # Builds on the branch as people left it, so a pushed conflict
             # resolution is never overwritten.
             base=$BRANCH
-            force=()
+            lease=
           else
             # With no open pull request, a branch left by a closed one is
             # replaced, unless someone pushed to it after this run fetched it.
             base=$TARGET
-            force=(--force-with-lease="refs/heads/$BRANCH:$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH" || true)")
+            lease="refs/heads/$BRANCH:$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH" || true)"
           fi
+          { echo "src=$src"; echo "pr=$pr"; echo "lease=$lease"; } >> "$GITHUB_OUTPUT"
+
+          dir="$RUNNER_TEMP/merge-branches"
+          mkdir -p "$dir"
+          if [ -n "$POST_MERGE" ]; then
+            # From the target, never from the pull request's branch or the
+            # source, which people can push to without review.
+            if [ "$(git ls-tree "origin/$TARGET" -- "$POST_MERGE" | cut -d' ' -f1)" != 100755 ]; then
+              echo "::error::post-merge: $POST_MERGE is not an executable file on $TARGET" >&2
+              exit 1
+            fi
+            git show "origin/$TARGET:$POST_MERGE" > "$dir/post-merge"
+            chmod +x "$dir/post-merge"
+          fi
+
           git checkout -B "$BRANCH" "origin/$base"
           if git merge-base --is-ancestor "$src" HEAD; then
             echo "$BRANCH already contains $SOURCE"
             exit 0
           fi
-          new_commits=$(git rev-list "HEAD..$src")
+          git rev-list "HEAD..$src" > "$dir/new-commits"
+          if ! git merge --no-ff --no-commit "$src" && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::git merge failed without reporting a conflict" >&2
+            exit 1
+          fi
+          git diff --name-only --diff-filter=U > "$dir/conflicts"
+          # The tree the commit would hold without the post-merge script, so
+          # the push step can name what the script changed.
+          index=$(mktemp)
+          cp "$(git rev-parse --git-path index)" "$index"
+          GIT_INDEX_FILE=$index git add -A
+          echo "tree=$(GIT_INDEX_FILE=$index git write-tree)" >> "$GITHUB_OUTPUT"
+          rm "$index"
+          echo merged=true >> "$GITHUB_OUTPUT"
+
+      # Runs with no token. It is not a sandbox: the script shares the runner
+      # and the checkout with the push step.
+      - name: Run the post-merge script
+        if: steps.merge.outputs.merged == 'true' && inputs.post-merge != ''
+        env:
+          POST_MERGE: ${{ inputs.post-merge }}
+        run: |
+          set -euo pipefail
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          if ! "$RUNNER_TEMP/merge-branches/post-merge" "${conflicts[@]}"; then
+            echo "::error::post-merge: $POST_MERGE failed" >&2
+            exit 1
+          fi
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::post-merge: $POST_MERGE committed or aborted the merge" >&2
+            exit 1
+          fi
+
+      - name: Commit, push, and open or update the pull request
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          POST_MERGE: ${{ inputs.post-merge }}
+          SRC: ${{ steps.merge.outputs.src }}
+          PR: ${{ steps.merge.outputs.pr }}
+          LEASE: ${{ steps.merge.outputs.lease }}
+          TREE: ${{ steps.merge.outputs.tree }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/merge-branches"
+          label=merge-conflict
+          pr=$PR
+          new_commits=$(cat "$dir/new-commits")
 
           # A modify/delete, rename or binary conflict leaves no markers, and
           # `git add -A` then keeps one side silently, so the unmerged paths are
           # recorded before staging.
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          git add -A
+          # What the post-merge script edited, and what it resolved without
+          # editing.
+          changed=()
+          if [ -n "$POST_MERGE" ]; then
+            mapfile -t changed < <(
+              { git diff --name-only "$TREE" "$(git write-tree)"
+                comm -23 <(LC_ALL=C sort "$dir/conflicts") <(printf '%s\n' "${conflicts[@]}" | LC_ALL=C sort)
+              } | sed '/^$/d' | LC_ALL=C sort -u)
+          fi
+
           subject="Merge $SOURCE into $TARGET"
+          note=
           warning=
           draft=()
-          if ! git merge --no-ff --no-edit -m "$subject" "$src"; then
-            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
-            if [ "${#conflicts[@]}" = 0 ]; then
-              echo "::error::git merge failed without reporting a conflict" >&2
-              exit 1
+          {
+            echo "$subject"
+            if [ "${#changed[@]}" != 0 ]; then
+              printf "\nChanged by \`%s\`:\n" "$POST_MERGE"
+              printf '    %s\n' "${changed[@]}"
             fi
-            git add -A
-            git commit --no-verify -F - <<EOF
-          $subject
+            if [ "${#conflicts[@]}" != 0 ]; then
+              printf '\nCommitted with these paths unresolved:\n'
+              printf '    %s\n' "${conflicts[@]}"
+            fi
+          } | git commit --no-verify -F -
+          if [ "${#changed[@]}" != 0 ]; then
+            note="
 
-          Committed with these paths unresolved:
-          $(printf '    %s\n' "${conflicts[@]}")
-          EOF
+          Changed by \`$POST_MERGE\`:
+          $(printf -- "- \`%s\`\n" "${changed[@]}")"
+          fi
+          if [ "${#conflicts[@]}" != 0 ]; then
             # Gated before the push: once the branch carries the source, the
             # next run has nothing to redo.
             gh label create "$label" --force --color B60205 --description "Committed with unresolved merge conflicts"
@@ -187,9 +285,16 @@ jobs:
           > To resolve, check out \`$BRANCH\`, fix these files, and push the fix as its own commit. Then remove the \`$label\` label and mark the pull request ready for review."
           fi
 
-          git push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          force=()
+          if [ -n "$LEASE" ]; then
+            force=(--force-with-lease="$LEASE")
+          fi
+          git -c "http.$GITHUB_SERVER_URL/.extraheader=AUTHORIZATION: basic $auth" \
+            push "${force[@]}" origin "HEAD:refs/heads/$BRANCH"
 
-          summary="Merges $(wc -l <<< "$new_commits") new commit(s) from \`$SOURCE\` at ${src:0:9}.$warning"
+          summary="Merges $(wc -l <<< "$new_commits") new commit(s) from \`$SOURCE\` at ${SRC:0:9}.$note$warning"
           if [ -n "$pr" ]; then
             gh pr comment "$pr" --body "$summary"
           else
