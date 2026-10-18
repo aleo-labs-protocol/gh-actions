@@ -2,7 +2,8 @@
 
 The reusable workflows and composite actions that aleo-labs-protocol
 repositories share: starting and running on the self-hosted runner fleet, and
-merging branches forward (`merge-branches.yml`). The fleet itself — the boxes,
+merging branches forward (`merge-branches.yml`), and bumping crates that have
+security advisories (`bump-advisories.yml`). The fleet itself — the boxes,
 their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
 
@@ -229,6 +230,48 @@ hooks, so a hook the script installs, say through a cargo build, never sees
 the token. Without credentials, the script cannot
 fetch objects the merge did not, so in a private repository it should read
 only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
+
+## Bumping crates with advisories
+
+`bump-advisories.yml` runs `cargo deny check advisories` on a branch, so pull
+requests need not gate on advisories published after they were opened.
+
+- It runs `cargo update -p` on each crate reported, then on the crates that
+  depend on any still reported. It keeps an update only if fewer findings
+  are left after it. The result is one pull request from
+  `ci/bump-advisories-into-<target>`. A run that changes the result rebuilds
+  that branch from the target and force-pushes it. A run that changes nothing
+  leaves it alone, and a run with nothing to fix closes it.
+- What that cannot fix, it lists in one issue labelled `cargo-advisories`
+  and titled for the target. It comments when an advisory is added and closes the issue when none are left.
+  The fix is a raised requirement in a `Cargo.toml`, or an ignore with a
+  reason in `deny.toml`.
+
+It pushes and writes as the merge-bot App, in the `merge-bot` environment, set
+up as under [Merging branches](#merging-branches). The caller owns the schedule:
+
+```yaml
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: bump-advisories
+
+jobs:
+  bump:
+    uses: aleo-labs-protocol/gh-actions/.github/workflows/bump-advisories.yml@v2
+    permissions: { contents: read }
+    with:
+      target: staging
+    secrets:
+      MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
+```
+
+The crates are updated before the App token is created, so nothing `cargo`
+runs can read it.
 
 ## Versioning
 
