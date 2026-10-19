@@ -32,7 +32,7 @@
 #
 #     gpu-test:
 #       needs: start-runners
-#       runs-on: [self-hosted, linux, x64, gpu, sm_89]
+#       runs-on: [self-hosted, linux, x64, gpu]
 #       ...
 #
 # The same workflow starts the CPU boxes for jobs that never needed a GPU: pass
@@ -97,8 +97,7 @@ on:
       label:
         description: >-
           The runner label whose queued jobs are counted, and the RunnerLabel tag
-          the fleet is found by -- a box's FIRST label, so `gpu` or `cpu`, never
-          a secondary one such as sm_89.
+          the fleet is found by -- a box's FIRST label, so `gpu` or `cpu`.
         required: false
         # A label no box is tagged with fails the run at Find the fleet rather
         # than counting zero forever.

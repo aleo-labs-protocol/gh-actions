@@ -984,7 +984,10 @@ ck "full L4 passes quietly" \
 # deployment card passes on one and proves less than it appears to.
 ck "L40S still warns (the comma matters)" \
    "$(which_gpu 'NVIDIA L40S, 8.9, 46068 MiB')" \
-   "::warning::ran on NVIDIA L40S, 8.9, 46068 MiB, not the L4 this code deploys to — different GPU memory, so a failure that depends on the deployment card's limits would not reproduce here|"
+   "::warning::ran on NVIDIA L40S, 8.9, 46068 MiB, not the L4 this code deploys to — a failure that depends on the deployment card's limits may not reproduce here|"
+ck "an A10G warns too" \
+   "$(which_gpu 'NVIDIA A10G, 8.6, 23028 MiB')" \
+   "::warning::ran on NVIDIA A10G, 8.6, 23028 MiB, not the L4 this code deploys to — a failure that depends on the deployment card's limits may not reproduce here|"
 # A g6f reports a PROFILE name. It matched neither arm before, so it fell to the
 # L40S branch and claimed the box might be more capable than the deployment
 # card -- the exact opposite of a slice with an eighth of the memory.
