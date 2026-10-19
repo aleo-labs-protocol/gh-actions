@@ -39,7 +39,7 @@ jobs:
 
   gpu-test:
     needs: start-runners
-    runs-on: [self-hosted, linux, x64, gpu, sm_89]
+    runs-on: [self-hosted, linux, x64, gpu]
     steps:
       - uses: aleo-labs-protocol/gh-actions/.github/actions/gpu-runner-preflight@v2
       - uses: actions/checkout@v5

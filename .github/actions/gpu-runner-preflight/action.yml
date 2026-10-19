@@ -56,10 +56,10 @@ runs:
         fi
         "${DISK_GUARD}" preflight "${RUNNER_WORKSPACE}"
 
-    # The capacity fallback in start-runner.yml can retype the box to a
-    # different Ada part. An L40S has roughly twice an L4's memory, so a test
-    # that would exhaust the deployment card passes on one. A green run on
-    # fallback hardware should say so rather than look identical.
+    # The capacity fallback in start-runner.yml can retype the box to another
+    # card: an L40S, with roughly twice an L4's memory, so a test that would
+    # exhaust the deployment card passes on one, or an A10G (sm_86). A green run
+    # on fallback hardware should say so rather than look identical.
     - name: Which GPU actually ran
       shell: bash
       env:
@@ -103,8 +103,8 @@ runs:
                  "one. Same sm_89, but a fraction of the memory and time-sliced SMs shared" \
                  "with other tenants: a pass here is a correctness result, not a timing one" ;;
           *) echo "::warning::ran on ${gpu}, not the ${EXPECTED_GPU} this code deploys to —" \
-                  "different GPU memory, so a failure that depends on the deployment card's" \
-                  "limits would not reproduce here" ;;
+                  "a failure that depends on the deployment card's limits may not" \
+                  "reproduce here" ;;
         esac
 
     # Peak GPU memory has to be sampled WHILE the tests run. An earlier version
