@@ -1438,13 +1438,16 @@ ba_step() { # step name, env assignments -> its exit code
 # Three advisories on zip 8.6.0, which self_update pins, shaped as cargo-deny
 # 0.20.2 reports them, after a log line and a warning that are not findings.
 # `cargo update -p "$BA_FIX"` clears them; every `cargo update -p` changes
-# Cargo.lock.
+# Cargo.lock, and `cargo deny --offline` fails until `cargo fetch` runs.
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
 case "$*" in
   "pkgid "*) ;;
-  "update -p "*) echo "$3" | tee -a "$BA_LOG" >> Cargo.lock;;
+  "update -p "*) echo "$3" | tee -a "$BA_LOG" >> Cargo.lock; touch "$BA_TMP/unfetched";;
+  fetch) rm -f "$BA_TMP/unfetched";;
   "deny --format json check advisories"|"deny --offline --format json check advisories")
+    [ "$2" = --offline ] && [ -e "$BA_TMP/unfetched" ] \
+      && { echo "error: failed to download \`$3\`: --offline was specified" >&2; exit 1; }
     [ -n "${BA_BROKEN:-}" ] && { echo "error: failed to fetch the advisory database" >&2; exit 1; }
     echo '{"type":"log","fields":{"level":"INFO","message":"fetching"}}' >&2
     echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"not encountered"}}' >&2
@@ -1472,7 +1475,7 @@ echo lock > "$ba_tmp/seed/Cargo.lock"
 git -C "$ba_tmp/seed" add Cargo.lock; git -C "$ba_tmp/seed" commit -q -m base
 git -C "$ba_tmp/seed" push -q "$ba_tmp/origin.git" staging
 ba_bump() { # env assignments -> the step's exit code
-  rm -rf "$ba_tmp/work" "$ba_tmp/runner"; mkdir "$ba_tmp/runner"
+  rm -rf "$ba_tmp/work" "$ba_tmp/runner" "$ba_tmp/unfetched"; mkdir "$ba_tmp/runner"
   git clone -q --branch staging "$ba_tmp/origin.git" "$ba_tmp/work"
   : > "$ba_tmp/log"; : > "$ba_tmp/outputs"; : > "$ba_tmp/out"
   ba_step "Update the crates with advisories" "$@"
