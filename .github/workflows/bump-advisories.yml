@@ -82,6 +82,8 @@ jobs:
             cargo pkgid "$1" > /dev/null 2>&1 || return 0
             cp Cargo.lock "$dir/Cargo.lock"
             cargo update -p "$1"
+            # An updated crate is not downloaded yet, and --offline cannot fetch it.
+            cargo fetch
             findings next --offline
             if [ "$(wc -l < "$dir/next")" -lt "$(wc -l < "$dir/after")" ]; then
               mv "$dir/next" "$dir/after"
