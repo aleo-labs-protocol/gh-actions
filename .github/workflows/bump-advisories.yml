@@ -75,6 +75,130 @@ jobs:
               exit 1
             fi
           }
+          # `cargo update -p foo` unlocks foo's dependencies too. A crate that
+          # stays locked but accepts a range, such as windows-sys
+          # ">=0.52, <0.62", is then relocked to the lowest version already in
+          # Cargo.lock that fits. `repair OLD` points each such edge back at its
+          # version in OLD, or the highest locked one above it. It keeps the
+          # result if `cargo metadata --locked` accepts it, and otherwise keeps
+          # each crate's repair that is accepted alone. `report BASE CHANGES
+          # DOWNGRADES` lists what changed since BASE, and the dependencies that
+          # moved to a lower version.
+          cat > "$dir/lock.py" <<'PY'
+          import re, subprocess, sys, tomllib
+          from functools import reduce
+
+          def key(v):
+              core, _, pre = v.split('+')[0].partition('-')
+              return (tuple(int(x) for x in core.split('.')), not pre,
+                      tuple((0, int(x), '') if x.isdigit() else (1, 0, x) for x in pre.split('.') if pre))
+
+          def load(path):
+              text = open(path).read()
+              return text, tomllib.loads(text).get('package', [])
+
+          def pid(p):
+              return p['name'], p['version'], p.get('source')
+
+          # Package id -> {dependency name: (entry, package id)}. An entry is
+          # "name", "name version" or "name version (source)", whichever is
+          # unique in its file. A name a package depends on twice is left out.
+          def edges(pkgs):
+              by = {}
+              for p in pkgs:
+                  by.setdefault(p['name'], []).append(pid(p))
+              out = {}
+              for p in pkgs:
+                  deps = {}
+                  for e in p.get('dependencies', []):
+                      name, ver, src = re.fullmatch(r'(\S+)(?: (\S+))?(?: \((.+)\))?', e).groups()
+                      c = [i for i in by.get(name, []) if ver in (None, i[1]) and src in (None, i[2])]
+                      deps[name] = None if name in deps or len(c) != 1 else (e, c[0])
+                  out[pid(p)] = {n: d for n, d in deps.items() if d}
+              return out
+
+          def lower(old, new):
+              return old[2] == new[2] and key(new[1]) < key(old[1])
+
+          def repair(old_path):
+              old = edges(load(old_path)[1])
+              text, pkgs = load('Cargo.lock')
+              ids = {pid(p) for p in pkgs}
+              fixes = {}
+              for parent, deps in edges(pkgs).items():
+                  for name, (e, n) in deps.items():
+                      o = old.get(parent, {}).get(name, (None, None))[1]
+                      if o and lower(o, n):
+                          ups = [i[1] for i in ids if i[0] == name and i[2] == n[2] and key(i[1]) >= key(o[1])]
+                          if ups:
+                              v = o[1] if o[1] in ups else max(ups, key=key)
+                              fixes.setdefault(parent, []).append((e, e.replace(f'{name} {n[1]}', f'{name} {v}', 1)))
+
+              def apply(text, parent):
+                  head = re.escape(f'\n[[package]]\nname = "{parent[0]}"\nversion = "{parent[1]}"\n'
+                                   + (f'source = "{parent[2]}"\n' if parent[2] else ''))
+                  m = re.search(head + r'(?!source = )(?:.+\n)*', text)
+                  if not m:
+                      return text
+                  block = m.group(0)
+                  for e, r in fixes[parent]:
+                      block = block.replace(f'\n "{e}",\n', f'\n "{r}",\n')
+                  return text[:m.start()] + block + text[m.end():]
+
+              def log(verb, parent):
+                  print(f'{verb} {parent[0]} {parent[1]}: ' + ', '.join(f'{e} -> {r}' for e, r in fixes[parent]),
+                        file=sys.stderr)
+
+              def accepted(text):
+                  open('Cargo.lock', 'w').write(text)
+                  return subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+              if not fixes:
+                  return
+              if accepted(reduce(apply, fixes, text)):
+                  for parent in fixes:
+                      log('repaired', parent)
+                  return
+              for parent in fixes:
+                  if accepted(t := apply(text, parent)):
+                      text = t
+                      log('repaired', parent)
+                  else:
+                      log('cannot repair', parent)
+              open('Cargo.lock', 'w').write(text)
+
+          def write(path, lines, n=200):
+              lines = sorted(lines)
+              if len(lines) > n:
+                  lines = lines[:n] + [f'- and {len(lines) - n} more']
+              open(path, 'w').write(''.join(f'{x}\n' for x in lines))
+
+          def report(base_path, changes, downgrades):
+              base, final = load(base_path)[1], load('Cargo.lock')[1]
+              was, ids = {pid(p) for p in base}, {pid(p) for p in final}
+              gone, added = was - ids, ids - was
+              lines = []  # (line, whether it is a downgrade)
+              for name in {i[0] for i in gone | added}:
+                  r, a = [i for i in gone if i[0] == name], [i for i in added if i[0] == name]
+                  if len(r) == len(a) == 1:
+                      lines.append((f'- `{name}` {r[0][1]} → {a[0][1]}', lower(r[0], a[0])))
+                  else:
+                      lines += [(f'- `{name}` {i[1]} added', False) for i in a]
+                      lines += [(f'- `{name}` {i[1]} removed', False) for i in r]
+              old, new = edges(base), edges(final)
+              for parent in old.keys() & new.keys():
+                  for name in old[parent].keys() & new[parent].keys():
+                      o, n = old[parent][name][1], new[parent][name][1]
+                      # A dependency that was itself updated is listed above.
+                      if o != n and o in ids:
+                          lines.append((f'- `{parent[0]} {parent[1]}` depends on `{name}` {n[1]}, not {o[1]}', lower(o, n)))
+              write(changes, [x for x, _ in lines])
+              write(downgrades, [x for x, d in lines if d])
+
+          {'repair': repair, 'report': report}[sys.argv[1]](*sys.argv[2:])
+          PY
+          cp Cargo.lock "$dir/base.lock"
           # Kept only if it leaves fewer findings, so an update that fixes
           # nothing stays out of the pull request.
           try() {
@@ -84,6 +208,7 @@ jobs:
             cargo update -p "$1"
             # An updated crate is not downloaded yet, and --offline cannot fetch it.
             cargo fetch
+            python3 "$dir/lock.py" repair "$dir/Cargo.lock"
             findings next --offline
             if [ "$(wc -l < "$dir/next")" -lt "$(wc -l < "$dir/after")" ]; then
               mv "$dir/next" "$dir/after"
@@ -99,7 +224,9 @@ jobs:
           mapfile -t parents < <(cut -f4 "$dir/after" | tr ' ' '\n' | sed '/^$/d' | sort -u)
           for p in "${parents[@]}"; do try "$p"; done
           awk -F'\t' 'FILENAME == ARGV[1] { left[$1 FS $2 FS $3]; next } !(($1 FS $2 FS $3) in left)' "$dir/after" "$dir/before" > "$dir/fixed"
+          python3 "$dir/lock.py" report "$dir/base.lock" "$dir/changes" "$dir/downgrades"
           echo "Before:"; cat "$dir/before"; echo "After:"; cat "$dir/after"
+          echo "Changes:"; cat "$dir/changes"; echo "Downgrades:"; cat "$dir/downgrades"
           git diff --quiet -- Cargo.lock || echo changed=true >> "$GITHUB_OUTPUT"
 
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -128,31 +255,75 @@ jobs:
                           printf "- %s in `%s %s`: %s\n", id, $2, $3, $5 }' "$1"
           }
 
+          bot="${APP_SLUG}[bot]"
+          fixed=$(list "$dir/fixed")
+          # What the pull request, or a comment on it, says the update does.
+          summary="$fixed
+
+          Changes:
+
+          $(cat "$dir/changes")
+
+          "
+          if [ -s "$dir/downgrades" ]; then
+            summary+="These are on a lower version than on \`$TARGET\`, and the workflow could not move them back:
+
+          $(cat "$dir/downgrades")
+
+          "
+          fi
+          unneeded="\`$TARGET\` no longer needs this update."
+
           # --head matches a fork's branch of the same name too.
           pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
                  --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
+          # The workflow pushes one commit of its own. A tip that someone else
+          # wrote or committed hands the branch to them: the workflow neither
+          # force-pushes over it nor closes it.
+          theirs() {
+            [ -n "$(BOT=$bot gh api "repos/$REPO/commits/$BRANCH" \
+                      --jq 'select(.author.login != env.BOT or .committer.login != env.BOT) | .sha')" ]
+          }
+          # Comments once per result, not once per run. The marker names the
+          # Cargo.lock this run computed, or `none` when the target needs none.
+          comment_once() { # marker, body
+            local marker="<!-- bump-advisories: $1 -->" bodies
+            # Not piped: grep -q exits at the first match, and under pipefail
+            # gh's SIGPIPE would read as no match.
+            bodies=$(gh api "repos/$REPO/issues/$pr/comments" --paginate --jq '.[].body')
+            if grep -qxF -- "$marker" <<< "$bodies"; then
+              echo "#$pr already has this comment"
+            else
+              gh pr comment "$pr" --body "$2
+
+          $marker"
+            fi
+          }
           if [ "$CHANGED" = true ]; then
-            if [ -n "$pr" ] && [ "$(gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)" = "$(git hash-object Cargo.lock)" ]; then
+            lock=$(git hash-object Cargo.lock)
+            if [ -n "$pr" ] && [ "$(gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)" = "$lock" ]; then
               echo "#$pr already holds this Cargo.lock"
+            elif [ -n "$pr" ] && theirs; then
+              comment_once "$lock" "\`$TARGET\` now needs a different \`Cargo.lock\`. Someone else has pushed to this branch, so the workflow does not rebuild it. Close this pull request, and the next run rebuilds the branch and opens a new one.
+
+          It would fix:
+
+          $summary"
             else
               # ci.yml runs this line on a real runner.
               # shellcheck disable=SC2016
               helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
               git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
-              bot="${APP_SLUG}[bot]"
               git config user.name "$bot"
               git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
               subject="Bump crates with security advisories"
-              fixed=$(list "$dir/fixed")
               git -c core.hooksPath=/dev/null checkout -B "$BRANCH"
               printf '%s\n\nFixes:\n%s\n' "$subject" "$fixed" | git -c core.hooksPath=/dev/null commit -F - -- Cargo.lock
               # Rebuilt from the target on every run that changes it.
               git -c core.hooksPath=/dev/null push --force origin "HEAD:refs/heads/$BRANCH"
               body="Updates \`Cargo.lock\` on \`$TARGET\` past these \`cargo deny check advisories\` findings:
 
-          $fixed
-
-          Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow. Each run that changes the result rebuilds this branch from \`$TARGET\` and force-pushes it, so do not push to it."
+          ${summary}Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow. Each run that changes the result rebuilds this branch from \`$TARGET\` and force-pushes it. Once someone else pushes to the branch, the workflow comments instead."
               if [ -n "$pr" ]; then
                 gh pr edit "$pr" --body "$body"
               else
@@ -160,7 +331,11 @@ jobs:
               fi
             fi
           elif [ -n "$pr" ]; then
-            gh pr close "$pr" --delete-branch --comment "\`$TARGET\` no longer needs this update."
+            if theirs; then
+              comment_once none "$unneeded Someone else has pushed to this branch, so the workflow leaves it open."
+            else
+              gh pr close "$pr" --delete-branch --comment "$unneeded"
+            fi
           fi
 
           issue=$(TITLE=$title gh issue list --label "$label" --state open --json number,title \

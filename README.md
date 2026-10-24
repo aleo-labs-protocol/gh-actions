@@ -242,6 +242,17 @@ requests need not gate on advisories published after they were opened.
   `ci/bump-advisories-into-<target>`. A run that changes the result rebuilds
   that branch from the target and force-pushes it. A run that changes nothing
   leaves it alone, and a run with nothing to fix closes it.
+- `cargo update -p foo` also unlocks foo's dependencies. A crate that accepts
+  a range, such as `windows-sys = ">=0.52, <0.62"`, can then move to a lower
+  version that is already in `Cargo.lock`. After each update the workflow moves
+  such edges back. It keeps a crate's repair only if `cargo metadata --locked`
+  accepts the result.
+- The pull request lists each version and dependency change from the target.
+  It lists separately each dependency left on a lower version.
+- Once the branch's tip is a commit that someone other than the App wrote or
+  committed, the workflow neither force-pushes nor closes the branch. It comments
+  once for each new result instead. Close the pull request to hand the branch
+  back.
 - What that cannot fix, it lists in one issue labelled `cargo-advisories`
   and titled for the target. It comments when an advisory is added and closes the issue when none are left.
   The fix is a raised requirement in a `Cargo.toml`, or an ignore with a
