@@ -1087,6 +1087,12 @@ ck "patterns and names together" \
 ck "a branch matched twice runs once" \
    "$(mb_check SOURCES='release/v4.13 release/* release/v4*' BRANCHES='release/v4.13' AHEAD_release_v4_13=1)" \
    '["release/v4.13"]'
+ck "sources on separate lines" \
+   "$(mb_check SOURCES=$'mainnet\nrelease/*' BRANCHES='release/v4.13' AHEAD_mainnet=1 AHEAD_release_v4_13=1)" \
+   '["mainnet","release/v4.13"]'
+ck "a pattern skips this workflow's branches" \
+   "$(mb_check SOURCES='*/v4.13*' BRANCHES='release/v4.13 ci/merge-release/v4.13-into-staging' AHEAD_release_v4_13=1)" \
+   '["release/v4.13"]'
 ck "a failed listing skips only it" \
    "$(mb_check SOURCES='mainnet release/*' BRANCHES=fail AHEAD_mainnet=1)" '["mainnet"] rc=1'
 mkdir -p "$mb_tmp/cwd/release-x"

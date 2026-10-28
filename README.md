@@ -128,8 +128,11 @@ count it could not take.
 target branch while the source has commits the target lacks.
 
 - A source with a glob character, such as `release/*`, stands for every
-  branch it matches except the target. It may match none. As in a shell
-  `case`, `*` also matches `/`.
+  branch it matches except the target and this workflow's `ci/merge-*`
+  branches. It may match none. As in a shell `case`, `*` also matches `/`.
+  Any branch pushed under the pattern gets a pull request, so protect
+  branch creation there. Quote a pattern that starts with `*`, which YAML
+  reads as an alias.
 - The pull request comes from `ci/merge-<source>-into-<target>`. Review is
   requested from the authors and reviewers of the merged pull requests behind
   the new commits.

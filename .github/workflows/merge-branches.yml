@@ -15,9 +15,9 @@ on:
         required: true
       sources:
         description: >-
-          Space-separated branches to merge into the target. A source with a
-          glob character, such as release/*, stands for every branch it
-          matches, which may be none.
+          Branches to merge into the target, separated by spaces or newlines. A
+          source with a glob character, such as release/*, stands for every
+          branch it matches, which may be none.
         type: string
         required: true
       post-merge:
@@ -58,7 +58,7 @@ jobs:
           pending=()
           failed=0
           srcs=()
-          read -ra patterns <<< "$SOURCES"
+          read -d '' -ra patterns <<< "$SOURCES" || true
           for pat in "${patterns[@]}"; do
             case $pat in
               *[*?[]*)
@@ -71,7 +71,7 @@ jobs:
                 while IFS= read -r name; do
                   # shellcheck disable=SC2254
                   case $name in
-                    "$TARGET"|"") ;;
+                    "$TARGET"|""|ci/merge-*) ;;
                     $pat) srcs+=("$name");;
                   esac
                 done <<< "$names"
