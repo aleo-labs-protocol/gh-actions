@@ -1030,9 +1030,8 @@ cat > "$mb_tmp/bin-check/gh" <<'GHEOF'
 var() { local s=$2; echo "$1_${s//[^A-Za-z0-9_]/_}"; }
 case "$*" in
   *matching-refs/heads/*) [ "$BRANCHES" = fail ] && { echo '{"message":"Server Error"}'; exit 1; }
-    p="$*"; p="${p#*matching-refs/heads/}"; p="${p%% *}"
-    for b in $BRANCHES; do [[ $b == "$p"* ]] && jq -n --arg r "refs/heads/$b" '{ref: $r}'; done \
-      | jq -s . | jq -r "$(jq_arg "$@")";;
+    jq -n --arg p "${3#*matching-refs/heads/}" --arg b "$BRANCHES" \
+      '[$b | split(" ")[] | select(startswith($p)) | {ref: "refs/heads/\(.)"}]' | jq -r "$(jq_arg "$@")";;
   *"compare/$TARGET..."*) v=$(var AHEAD "${2##*...}")
     [ "${!v}" = fail ] && { echo '{"message":"Not Found"}'; exit 1; }
     echo "${!v}";;
@@ -1085,6 +1084,9 @@ ck "a pattern skips the target" \
 ck "patterns and names together" \
    "$(mb_check SOURCES='mainnet release/*' BRANCHES='mainnet release/v4.13' AHEAD_mainnet=1 AHEAD_release_v4_13=1)" \
    '["mainnet","release/v4.13"]'
+ck "a branch matched twice runs once" \
+   "$(mb_check SOURCES='release/v4.13 release/* release/v4*' BRANCHES='release/v4.13' AHEAD_release_v4_13=1)" \
+   '["release/v4.13"]'
 ck "a failed listing skips only it" \
    "$(mb_check SOURCES='mainnet release/*' BRANCHES=fail AHEAD_mainnet=1)" '["mainnet"] rc=1'
 mkdir -p "$mb_tmp/cwd/release-x"

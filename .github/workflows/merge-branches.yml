@@ -68,18 +68,21 @@ jobs:
                   failed=1
                   continue
                 fi
-                # As in a shell `case`, `*` also matches `/`.
                 while IFS= read -r name; do
-                  # shellcheck disable=SC2053
-                  if [ -n "$name" ] && [ "$name" != "$TARGET" ] && [[ $name == $pat ]]; then
-                    srcs+=("$name")
-                  fi
+                  # shellcheck disable=SC2254
+                  case $name in
+                    "$TARGET"|"") ;;
+                    $pat) srcs+=("$name");;
+                  esac
                 done <<< "$names"
                 ;;
               *) srcs+=("$pat");;
             esac
           done
+          declare -A seen=()
           for src in "${srcs[@]}"; do
+            [ -z "${seen[$src]:-}" ] || continue
+            seen[$src]=1
             if [ "$src" = "$TARGET" ]; then
               echo "::error::$src is both a source and the target" >&2
               exit 1
