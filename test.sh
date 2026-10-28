@@ -1021,19 +1021,26 @@ JQEOF
 # AHEAD_<src> is how far the source is ahead of the target ("fail" fails the
 # call), OPEN_<src> and FORK_<src> how many pull requests from this repository
 # and from forks are open from its branch, MISSING_<src> how many of the
-# source's commits that branch lacks.
+# source's commits that branch lacks. <src> has each character that cannot be in
+# a variable name replaced by `_`. BRANCHES lists the repository's branches
+# ("fail" fails the listing).
 cat > "$mb_tmp/bin-check/gh" <<'GHEOF'
 #!/bin/bash
 . "$MB_JQ_ARG"
+var() { local s=$2; echo "$1_${s//[^A-Za-z0-9_]/_}"; }
 case "$*" in
-  *"compare/$TARGET..."*) v="AHEAD_${2##*...}"
+  *matching-refs/heads/*) [ "$BRANCHES" = fail ] && { echo '{"message":"Server Error"}'; exit 1; }
+    p="$*"; p="${p#*matching-refs/heads/}"; p="${p%% *}"
+    for b in $BRANCHES; do [[ $b == "$p"* ]] && jq -n --arg r "refs/heads/$b" '{ref: $r}'; done \
+      | jq -s . | jq -r "$(jq_arg "$@")";;
+  *"compare/$TARGET..."*) v=$(var AHEAD "${2##*...}")
     [ "${!v}" = fail ] && { echo '{"message":"Not Found"}'; exit 1; }
     echo "${!v}";;
-  *"pr list"*) h="$*"; h="${h#*--head ci/merge-}"; o="OPEN_${h%%-into-*}"; f="FORK_${h%%-into-*}"
+  *"pr list"*) h="$*"; h="${h#*--head ci/merge-}"; o=$(var OPEN "${h%%-into-*}"); f=$(var FORK "${h%%-into-*}")
     jq -n --argjson o "${!o:-0}" --argjson f "${!f:-0}" \
       '[range($f) | {isCrossRepository: true}] + [range($o) | {isCrossRepository: false}]' \
       | jq -r "$(jq_arg "$@")";;
-  *compare/ci/merge-*) s="${2#*compare/ci/merge-}"; v="MISSING_${s%%-into-*}"; echo "${!v}";;
+  *compare/ci/merge-*) s="${2#*compare/ci/merge-}"; v=$(var MISSING "${s%%-into-*}"); echo "${!v}";;
   *) echo "unexpected: gh $*" >&2; exit 1;;
 esac
 GHEOF
@@ -1065,6 +1072,24 @@ ck "one source failing skips only it" \
    "$(mb_check SOURCES='testnet mainnet' AHEAD_testnet=fail AHEAD_mainnet=2)" '["mainnet"] rc=1'
 ck "a source that is the target fails" \
    "$(mb_check SOURCES='staging' AHEAD_staging=0)" ' rc=1'
+ck "a pattern stands for the branches it matches" \
+   "$(mb_check SOURCES='release/*' BRANCHES='release/v4.12 release/v4.13 releases staging' \
+      AHEAD_release_v4_12=0 AHEAD_release_v4_13=2)" '["release/v4.13"]'
+ck "a pattern's branch names its pull request's" \
+   "$(mb_check SOURCES='release/*' BRANCHES='release/v4.13' AHEAD_release_v4_13=1 >/dev/null; sed -n 's/^pending=//p' "$mb_tmp/out")" \
+   '[{"source":"release/v4.13","branch":"ci/merge-release/v4.13-into-staging"}]'
+ck "a pattern matching nothing passes" \
+   "$(mb_check SOURCES='release/*' BRANCHES='staging')" '[]'
+ck "a pattern skips the target" \
+   "$(mb_check SOURCES='stag*' BRANCHES='staging')" '[]'
+ck "patterns and names together" \
+   "$(mb_check SOURCES='mainnet release/*' BRANCHES='mainnet release/v4.13' AHEAD_mainnet=1 AHEAD_release_v4_13=1)" \
+   '["mainnet","release/v4.13"]'
+ck "a failed listing skips only it" \
+   "$(mb_check SOURCES='mainnet release/*' BRANCHES=fail AHEAD_mainnet=1)" '["mainnet"] rc=1'
+mkdir -p "$mb_tmp/cwd/release-x"
+ck "a pattern is not a path" \
+   "$(cd "$mb_tmp/cwd" && mb_check SOURCES='release*' BRANCHES='release/v4.13' AHEAD_release_v4_13=1)" '["release/v4.13"]'
 
 echo "== merge-branches: merging, conflicts and reviewers =="
 # A real git remote, so the merge, the push and what the branch ends up holding
