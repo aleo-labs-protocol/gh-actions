@@ -127,6 +127,12 @@ count it could not take.
 `merge-branches.yml` keeps one pull request open from each source branch into a
 target branch while the source has commits the target lacks.
 
+- A source with a glob character, such as `release/*`, stands for every
+  branch it matches except the target and this workflow's `ci/merge-*`
+  branches. It may match none. As in a shell `case`, `*` also matches `/`.
+  Any branch pushed under the pattern gets a pull request, so protect
+  branch creation there. Quote a pattern that starts with `*`, which YAML
+  reads as an alias.
 - The pull request comes from `ci/merge-<source>-into-<target>`. Review is
   requested from the authors and reviewers of the merged pull requests behind
   the new commits.
@@ -157,7 +163,7 @@ jobs:
     permissions: { contents: read, pull-requests: read }
     with:
       target: staging
-      sources: testnet mainnet
+      sources: release/*
     secrets:
       MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
 ```
@@ -196,7 +202,7 @@ A caller can name a script that runs after every merge, before the commit:
 ```yaml
     with:
       target: staging
-      sources: testnet mainnet
+      sources: release/*
       post-merge: .github/merge-fixup.sh
 ```
 

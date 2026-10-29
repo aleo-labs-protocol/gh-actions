@@ -14,7 +14,10 @@ on:
         type: string
         required: true
       sources:
-        description: Space-separated branches to merge into the target.
+        description: >-
+          Branches to merge into the target, separated by spaces or newlines. A
+          source with a glob character, such as release/*, stands for every
+          branch it matches, which may be none.
         type: string
         required: true
       post-merge:
@@ -54,7 +57,32 @@ jobs:
           set -euo pipefail
           pending=()
           failed=0
-          for src in $SOURCES; do
+          srcs=()
+          read -d '' -ra patterns <<< "$SOURCES" || true
+          for pat in "${patterns[@]}"; do
+            case $pat in
+              *[*?[]*)
+                if ! names=$(gh api --paginate "repos/$REPO/git/matching-refs/heads/${pat%%[*?[]*}" \
+                               --jq '.[].ref | ltrimstr("refs/heads/")'); then
+                  echo "::error::could not list the branches matching $pat" >&2
+                  failed=1
+                  continue
+                fi
+                while IFS= read -r name; do
+                  # shellcheck disable=SC2254
+                  case $name in
+                    "$TARGET"|""|ci/merge-*) ;;
+                    $pat) srcs+=("$name");;
+                  esac
+                done <<< "$names"
+                ;;
+              *) srcs+=("$pat");;
+            esac
+          done
+          declare -A seen=()
+          for src in "${srcs[@]}"; do
+            [ -z "${seen[$src]:-}" ] || continue
+            seen[$src]=1
             if [ "$src" = "$TARGET" ]; then
               echo "::error::$src is both a source and the target" >&2
               exit 1
