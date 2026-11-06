@@ -2,7 +2,8 @@
 
 The reusable workflows and composite actions that aleo-labs-protocol
 repositories share: starting and running on the self-hosted runner fleet, and
-merging branches forward (`merge-branches.yml`), and bumping crates that have
+merging branches forward (`merge-branches.yml`), mirroring branches into
+another repository (`mirror-branches.yml`), and bumping crates that have
 security advisories (`bump-advisories.yml`). The fleet itself — the boxes,
 their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
@@ -236,6 +237,87 @@ hooks, so a hook the script installs, say through a cargo build, never sees
 the token. Without credentials, the script cannot
 fetch objects the merge did not, so in a private repository it should read
 only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
+
+## Mirroring branches
+
+`mirror-branches.yml` fast-forwards branches of a mirror repository, under the
+same owner, to the caller's. The use is a private copy of a public repository,
+such as `snarkOS-internal` for `snarkOS`, whose `staging` follows public
+`staging` and nothing else.
+
+- Each listed branch in the mirror moves to where it is in the caller, and is
+  created if the mirror lacks it.
+- It never force-pushes. A mirror branch the caller's does not contain, because
+  the mirror has commits of its own or the caller's branch was rewritten,
+  fails the run and is left as it is. The other branches are still mirrored.
+- The branch is read again just before the push, so a run that starts late, or
+  queues behind another, pushes the current head rather than its trigger's. A
+  push refused because another run already moved the mirror past it is not an
+  error, so a caller can run on every push and on a schedule too.
+- A run with nothing to mirror reads two refs and clones nothing.
+
+```yaml
+name: Mirror staging
+
+on:
+  push:
+    branches: [staging]
+  # Catches a push whose run failed or never started.
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: mirror-staging
+
+jobs:
+  mirror:
+    # The mirror holds this file too. Without this, the bot's push there would
+    # start a run in the mirror.
+    if: github.repository == 'aleo-labs-protocol/snarkOS'
+    uses: aleo-labs-protocol/gh-actions/.github/workflows/mirror-branches.yml@v2
+    permissions: { contents: read }
+    with:
+      mirror: snarkOS-internal
+      branches: staging
+    secrets:
+      MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
+```
+
+It pushes as the merge-bot App, from the caller's `merge-bot` environment, as
+[Merging branches](#merging-branches) describes. Install the App on the mirror
+too. The token is scoped to the mirror alone, with contents and workflows
+write: the mirrored commits carry the caller's workflow files, which GitHub
+refuses to take without workflows.
+
+In the mirror, two rulesets on the mirrored branches make the bot the only
+writer and fast-forwards the only change:
+
+- `update` and `creation`, with the merge-bot App as the only bypass actor;
+- `non_fast_forward` and `deletion`, with no bypass actor, so the bot cannot
+  rewrite the branch either.
+
+A bypass actor skips every rule in its ruleset, which is why they are two. With
+no admin bypass, a person who must move the branch edits the first ruleset.
+GitHub accepts the App as a bypass actor only once it is installed on the mirror.
+
+The mirror also receives the caller's workflows, and runs them: its own
+schedules, releases and bumps. `disable-mirror-workflows.sh` disables every
+one but those named, by default `ci.yml`:
+
+```sh
+./disable-mirror-workflows.sh aleo-labs-protocol/snarkOS-internal
+```
+
+A disabled workflow stays disabled when its file changes, but a new file arrives
+enabled. The run warns when a fast-forward brings one, and names it in its
+summary; run the script again then. GitHub lists a workflow only once something
+has triggered it, so the script reports the files it cannot disable yet.
+
+Dependabot runs in the mirror too, from the mirrored `dependabot.yml`, and its
+entry cannot be disabled. A ruleset in the mirror that blocks creating
+`dependabot/**` branches stops its pull requests.
 
 ## Bumping crates with advisories
 
