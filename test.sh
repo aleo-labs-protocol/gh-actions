@@ -1745,10 +1745,110 @@ ck "clean: the comment says why"     "$(grep -c 'no longer needs this update' "$
 cp "$ba_tmp/body.pr-comment" "$ba_tmp/comment"
 ck "clean, commented: nothing"       "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_COMMENTS="$ba_tmp/comment")$(ba_log)" "0"
 # ci.yml's credential-helper job checks merge-branches.yml's copy.
-ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories}.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
+ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories,mirror-branches}.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$ba_tmp"
+
+echo "== mirror-branches: fast-forward only =="
+# Real repositories over file://, so what the mirror ends up holding is git's
+# own answer. The steps' own shell runs, from the YAML.
+mr_tmp="$(mktemp -d)"
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$mr_tmp/gitconfig"
+git config -f "$GIT_CONFIG_GLOBAL" user.name test
+git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
+git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch staging
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/workflows/mirror-branches.yml'))
+st = {x.get('name'): x for x in d['jobs']['mirror']['steps'] if x.get('name')}
+open('$mr_tmp/check.sh', 'w').write(st['Find the branches the mirror lacks']['run'])
+open('$mr_tmp/push.sh', 'w').write(st['Fast-forward the mirror']['run'])
+"
+mkdir -p "$mr_tmp/o"
+git init -q "$mr_tmp/work"
+mr_git() { git -C "$mr_tmp/work" "$@"; }
+mr_commit() { mr_git commit -q --allow-empty -m "$1"; mr_git rev-parse HEAD; }
+# A fresh source and mirror: both branches at one commit, pushed to both.
+mr_reset() {
+  rm -rf "$mr_tmp/o"/*.git "$mr_tmp/runner"
+  git init -q --bare "$mr_tmp/o/r.git"; git init -q --bare "$mr_tmp/o/m.git"
+  mr_git checkout -q --orphan "base-$RANDOM"; mr_base=$(mr_commit base)
+  mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/staging HEAD:refs/heads/canary
+  mr_git push -q "$mr_tmp/o/m.git" HEAD:refs/heads/staging HEAD:refs/heads/canary
+}
+mr_head() { git -C "$mr_tmp/o/$1.git" rev-parse -q --verify "refs/heads/$2" || echo none; }
+# Runs both steps as the job would: the push only when the check found work.
+# Prints the push step's exit code, or "-" when it was skipped.
+mr_run() {
+  mkdir -p "$mr_tmp/runner"; : > "$mr_tmp/out"
+  local -a e=(GITHUB_SERVER_URL="file://$mr_tmp" MIRROR_URL="file://$mr_tmp/o/m.git" SOURCE_URL="file://$mr_tmp/o/r.git"
+              BRANCHES="${1:-staging}" RUNNER_TEMP="$mr_tmp/runner" GITHUB_OUTPUT="$mr_tmp/out"
+              GITHUB_STEP_SUMMARY="$mr_tmp/summary" GH_TOKEN=tok-SECRET-m SOURCE_TOKEN=tok-SECRET-s)
+  env "${e[@]}" bash "$mr_tmp/check.sh" >/dev/null 2>&1 || { echo "check failed"; return; }
+  local pending; pending=$(sed -n 's/^pending=//p' "$mr_tmp/out")
+  if [ -z "$pending" ]; then echo -; return; fi
+  env "${e[@]}" PENDING="$pending" bash "$mr_tmp/push.sh" >"$mr_tmp/push.log" 2>&1; echo "$?"
+}
+
+mr_reset
+ck "up to date: nothing to push"     "$(mr_run)" "-"
+mr_reset; mr_git checkout -q --detach "$mr_base"; new=$(mr_commit one); new=$(mr_commit two)
+mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/staging
+ck "behind: pushed"                  "$(mr_run)" "0"
+ck "behind: now at the source"       "$(mr_head m staging)" "$new"
+ck "behind: the summary says so"     "$(grep -c "staging: $mr_base -> $new" "$mr_tmp/summary")" "1"
+mr_reset; git -C "$mr_tmp/o/m.git" update-ref -d refs/heads/canary
+ck "missing in the mirror: created"  "$(mr_run canary)$(mr_head m canary)" "0$mr_base"
+mr_reset; mr_git checkout -q --detach "$mr_base"; own=$(mr_commit private)
+mr_git push -q "$mr_tmp/o/m.git" HEAD:refs/heads/staging
+ck "mirror ahead: fails"             "$(mr_run)" "1"
+ck "mirror ahead: left as it was"    "$(mr_head m staging)" "$own"
+mr_reset; mr_git checkout -q --detach "$mr_base"; own=$(mr_commit private)
+mr_git push -q "$mr_tmp/o/m.git" HEAD:refs/heads/staging
+mr_git checkout -q --detach "$mr_base"; mr_commit public >/dev/null
+mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/staging
+ck "diverged: fails"                 "$(mr_run)" "1"
+ck "diverged: not forced"            "$(mr_head m staging)" "$own"
+# One branch diverged must not hold up another.
+mr_git checkout -q --detach "$mr_base"; can=$(mr_commit canary)
+mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/canary
+ck "two, one diverged: fails"        "$(mr_run 'staging canary')" "1"
+ck "two, one diverged: other pushed" "$(mr_head m canary)" "$can"
+mr_reset; mr_git checkout -q --detach "$mr_base"; old=$(mr_commit one); mr_commit two >/dev/null
+mr_git push -q "$mr_tmp/o/m.git" HEAD:refs/heads/staging
+mr_git push -q -f "$mr_tmp/o/r.git" "$old:refs/heads/staging"
+ck "source rewound: fails"           "$(mr_run)" "1"
+ck "missing in the source: fails"    "$(mr_run nope)" "check failed"
+# A new workflow file arrives enabled in the mirror, so the run says so.
+mr_reset; mr_git checkout -q --detach "$mr_base"; mkdir -p "$mr_tmp/work/.github/workflows"
+echo 'on: push' > "$mr_tmp/work/.github/workflows/new.yml"; mr_git add .github/workflows/new.yml
+mr_git commit -q -m wf; mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/staging; : > "$mr_tmp/summary"
+ck "new workflow: still pushed"      "$(mr_run)" "0"
+ck "new workflow: named"             "$(grep -c 'New workflow, enabled in the mirror: `.github/workflows/new.yml`' "$mr_tmp/summary")" "1"
+# The mirror refuses the push. The hook stands in for a ruleset, and for a
+# run that got there first: with MR_LATER it moves the branch past this one.
+mr_refuse() {
+  local later=${1:-}
+  cat > "$mr_tmp/o/m.git/hooks/pre-receive" <<HOOK
+#!/bin/bash
+# A ref update is refused inside the push's quarantine.
+[ -z "$later" ] || env -u GIT_QUARANTINE_PATH git update-ref refs/heads/staging "$later"
+echo refused >&2; exit 1
+HOOK
+  chmod +x "$mr_tmp/o/m.git/hooks/pre-receive"
+}
+mr_reset; mr_git checkout -q --detach "$mr_base"; new=$(mr_commit one)
+mr_git push -q "$mr_tmp/o/r.git" HEAD:refs/heads/staging; mr_refuse
+ck "refused: fails"                  "$(mr_run)" "1"
+ck "refused: left as it was"         "$(mr_head m staging)" "$mr_base"
+later=$(mr_commit two); rm "$mr_tmp/o/m.git/hooks/pre-receive"
+mr_git push -q "$mr_tmp/o/m.git" HEAD:refs/hold/later; mr_refuse "$later"
+ck "refused, another run past: ok"   "$(mr_run)" "0"
+ck "the token never in the config"   "$(grep -c tok-SECRET "$mr_tmp/runner/mirror/.git/config")" "0"
+
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+rm -rf "$mr_tmp"
 
 rm -rf "$no_aws"
 echo

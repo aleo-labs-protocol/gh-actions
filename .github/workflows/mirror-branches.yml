@@ -1,0 +1,145 @@
+# Fast-forwards branches of a mirror repository to this repository's. The
+# mirror is another repository of the same owner, typically a private copy that
+# holds work not yet public. A mirror branch that has diverged fails the run,
+# and is never force-pushed.
+#
+# Usage and setup: "Mirroring branches" in README.md.
+name: mirror-branches
+
+on:
+  workflow_call:
+    inputs:
+      mirror:
+        description: The mirror repository's name, under this repository's owner.
+        type: string
+        required: true
+      branches:
+        description: Branches to mirror, separated by spaces or newlines.
+        type: string
+        default: staging
+    secrets:
+      # As in merge-branches.yml: the caller's job has no environment, so the
+      # value it passes is empty, and this job receives the environment's.
+      MERGE_BOT_APP_KEY:
+        required: false
+
+permissions: {}
+
+env:
+  MIRROR_URL: ${{ github.server_url }}/${{ github.repository_owner }}/${{ inputs.mirror }}.git
+  SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+  BRANCHES: ${{ inputs.branches }}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # The caller's environment, which admits only runs on its protected branch,
+    # so a workflow on any other branch cannot read the app key.
+    environment: merge-bot
+    permissions: { contents: read }
+    steps:
+      # The mirror alone, with contents and workflows: the branches carry the
+      # source's workflow files, which GitHub refuses to take without it.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.mirror }}
+          permission-contents: write
+          permission-workflows: write
+
+      # Reads both heads before any clone, so a run with nothing to do is quick.
+      - name: Find the branches the mirror lacks
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SOURCE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/mirror"
+          cd "$RUNNER_TEMP/mirror"
+          # The token is read when git asks, so the config holds none. The same
+          # helper as merge-branches.yml's; the source gets the job's own token.
+          # shellcheck disable=SC2016
+          helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
+          git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
+          read -d '' -ra names <<< "$BRANCHES" || true
+          pending=()
+          for b in "${names[@]}"; do
+            src=$(GH_TOKEN=$SOURCE_TOKEN git ls-remote "$SOURCE_URL" "refs/heads/$b" | cut -f1)
+            if [ -z "$src" ]; then
+              echo "::error::$b does not exist here" >&2
+              exit 1
+            fi
+            dst=$(git ls-remote "$MIRROR_URL" "refs/heads/$b" | cut -f1)
+            if [ "$src" = "$dst" ]; then
+              echo "$b: the mirror is at ${src:0:9}"
+            else
+              echo "$b: ${dst:0:9} in the mirror, ${src:0:9} here"
+              pending+=("$b")
+            fi
+          done
+          echo "pending=${pending[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Fast-forward the mirror
+        if: steps.check.outputs.pending != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SOURCE_TOKEN: ${{ github.token }}
+          PENDING: ${{ steps.check.outputs.pending }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/mirror"
+          read -ra todo <<< "$PENDING"
+          # Whether commit $1 contains commit $2, which may be unknown here.
+          contains() { git cat-file -e "$2^{commit}" 2>/dev/null && git merge-base --is-ancestor "$2" "$1"; }
+          # The whole history, so the push sends only what the mirror lacks,
+          # and the mirror's tip can be found in it.
+          fetch_source() { GH_TOKEN=$SOURCE_TOKEN git fetch -q "$SOURCE_URL" "+refs/heads/$1:refs/source/$1"; git rev-parse "refs/source/$1"; }
+          failed=0
+          for b in "${todo[@]}"; do
+            # Read again here: a branch that moved since the check is pushed
+            # where it is now.
+            src=$(fetch_source "$b")
+            dst=$(git ls-remote "$MIRROR_URL" "refs/heads/$b" | cut -f1)
+            if [ -n "$dst" ] && ! contains "$src" "$dst"; then
+              # Another run, on a push or the schedule, may have pushed a later
+              # commit of this branch since the fetch.
+              src=$(fetch_source "$b")
+            fi
+            if [ "$src" = "$dst" ]; then
+              echo "$b: the mirror is at ${src:0:9}"
+              continue
+            fi
+            # Not in this history: the mirror has commits of its own, or this
+            # branch was rewritten. Either way a person decides.
+            if [ -n "$dst" ] && ! contains "$src" "$dst"; then
+              echo "::error::$b in ${MIRROR_URL##*/} is at ${dst:0:9}, which $b here at ${src:0:9} does not contain; the mirror is left as it is" >&2
+              failed=1
+              continue
+            fi
+            # Never forced. The mirror's rules refuse a non-fast-forward too.
+            if ! git -c core.hooksPath=/dev/null push -q "$MIRROR_URL" "$src:refs/heads/$b"; then
+              # Fine if another run, on a push or the schedule, got there first
+              # with this commit or a later one.
+              if git fetch -q "$MIRROR_URL" "+refs/heads/$b:refs/mirror/$b" \
+                 && contains "refs/mirror/$b" "$src"; then
+                echo "$b: another run already moved the mirror past ${src:0:9}"
+                continue
+              fi
+              echo "::error::$b: the push to ${MIRROR_URL##*/} was refused" >&2
+              failed=1
+              continue
+            fi
+            echo "$b: ${dst:-(none)} -> $src" | tee -a "$GITHUB_STEP_SUMMARY"
+            # A workflow file the mirror has not had arrives enabled there.
+            if [ -n "$dst" ]; then
+              while IFS= read -r f; do
+                echo "::warning file=$f::$f is new in ${MIRROR_URL##*/}, and enabled there. Disable it in the mirror unless it should run there."
+                echo "New workflow, enabled in the mirror: \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+              done < <(git diff --name-only --diff-filter=A "$dst" "$src" -- .github/workflows)
+            fi
+          done
+          exit "$failed"
