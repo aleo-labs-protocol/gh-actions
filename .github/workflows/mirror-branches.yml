@@ -1,7 +1,6 @@
 # Fast-forwards branches of a mirror repository to this repository's. The
-# mirror is another repository of the same owner, typically a private copy that
-# holds work not yet public. A mirror branch that has diverged fails the run,
-# and is never force-pushed.
+# mirror is another repository of the same owner, typically a private copy. A
+# mirror branch that has diverged fails the run, and is never force-pushed.
 #
 # Usage and setup: "Mirroring branches" in README.md.
 name: mirror-branches

@@ -242,8 +242,8 @@ only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
 
 `mirror-branches.yml` fast-forwards branches of a mirror repository, under the
 same owner, to the caller's. The use is a private copy of a public repository,
-such as `snarkOS-internal` for `snarkOS`, where fixes are prepared before they
-are public: its `staging` follows public `staging` and nothing else.
+such as `snarkOS-internal` for `snarkOS`, whose `staging` follows public
+`staging` and nothing else.
 
 - Each listed branch in the mirror moves to where it is in the caller, and is
   created if the mirror lacks it.
