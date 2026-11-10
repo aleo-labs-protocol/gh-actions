@@ -149,8 +149,8 @@ ck "a stale offline registration is not busy" "$(census 3 3 1)" "0"
 # also what an idle fleet looks like. Write nothing rather than write 0, so the
 # plan step can tell "nobody is busy" from "could not look".
 # BOXES, because the plan step adds this to a count of EC2 instances. A box
-# with RUNNER_SLOTS > 1 registers one runner per slot as NAME-1, NAME-2
-# (runner-install.sh), so counting registrations makes one busy box read as
+# with RUNNER_SLOTS > 1 registers one runner per slot as NAME-1, NAME-2,
+# so counting registrations makes one busy box read as
 # three and takes `want` straight to the fleet cap.
 ck "a multi-slot box is one busy box" \
    "$(census_named "cpu-runner-1 cpu-runner-2 cpu-runner-3")" "1"
@@ -297,7 +297,7 @@ ck "job setup gates every step on the box" \
    "$(f="$REPO/.github/actions/runner-job-setup/action.yml"; [[ $(grep -c "if: runner.environment == 'self-hosted'" "$f") == $(grep -c '^    - name:' "$f") ]] && echo yes || echo no)" "yes"
 ck "job setup takes the box's rustup lock" "$(grep -c 'flock /tmp/rustup.lock cargo --version' "$REPO/.github/actions/runner-job-setup/action.yml")" "1"
 
-# The sccache four, re-asserted through GITHUB_ENV (issue #58). Run rather than
+# The sccache four, re-asserted through GITHUB_ENV. Run rather than
 # grepped, because what matters is which names come out and where they come
 # FROM: the box's file, not the step's own environment, which a job-level `env:`
 # has already reached. Only the source path is rewritten -- so a step that read
@@ -527,7 +527,7 @@ ck "short of the target, with a box up, warns" \
 # separate step that may not have happened.
 ck "an unprovisioned box is a notice" \
    "$(box cpu-runner c6i.8xlarge running c6i.8xlarge > "$sc_tmp/inv"; WANT=2 cpu_fleet)" \
-   "::notice::no instance tagged cpu-runner2; that box is not provisioned (ROLE=cpu2 ./provision.sh)|::notice::no instance tagged cpu-runner3; that box is not provisioned (ROLE=cpu3 ./provision.sh)|::warning::wanted 2 cpu boxes, have 1; the queue will drain slower|"
+   "::notice::no instance tagged cpu-runner2; that box is not provisioned (role cpu2)|::notice::no instance tagged cpu-runner3; that box is not provisioned (role cpu3)|::warning::wanted 2 cpu boxes, have 1; the queue will drain slower|"
 # Two instances wearing one Name tag is a provisioning mistake, and starting
 # either is a guess. Skipped and said, rather than head -1.
 ck "an ambiguous tag is left alone" \
@@ -697,19 +697,17 @@ ck "the box the fleet depends on waits for the stop to finish" \
       FAIL_i_cpu_runner=STATE,OK bash "$sc_tmp/start.sh" 2>&1 | grep -E "^started |^::" | tr '\n' '|')" \
    "started cpu-runner as c6i.8xlarge|"
 
-# Anchored: `ROLE=` also matches inside `CUDA_ROLE=`, so the unanchored version
-# these started as stayed green against the name the #110 rename removed.
-# The provision hint has to name a role lib.sh accepts: <class>-runner<n> is the
+# The provision hint has to name a real role: <class>-runner<n> is the
 # role <class><n>. Stripping "-runner" alone left a third box as "cpu-runner3",
-# and the notice named a command that errors.
+# which is not a role.
 ck "provision hint names the role for gpu-runner" \
-   "$(MISSING_TAG=gpu-runner TAG=gpu-runner start_chain g6.4xlarge OK | grep -oE '\bROLE=[a-z0-9]+')" "ROLE=gpu"
+   "$(MISSING_TAG=gpu-runner TAG=gpu-runner start_chain g6.4xlarge OK | grep -oE '\(role [a-z0-9]+\)')" "(role gpu)"
 ck "provision hint names the role for gpu-runner2" \
-   "$(MISSING_TAG=gpu-runner2 TAG=gpu-runner2 start_chain g6.xlarge OK | grep -oE '\bROLE=[a-z0-9]+')" "ROLE=gpu2"
+   "$(MISSING_TAG=gpu-runner2 TAG=gpu-runner2 start_chain g6.xlarge OK | grep -oE '\(role [a-z0-9]+\)')" "(role gpu2)"
 ck "provision hint names the role for cpu-runner" \
-   "$(MISSING_TAG=cpu-runner TAG=cpu-runner LABEL=cpu start_chain c6i.8xlarge OK | grep -oE '\bROLE=[a-z0-9]+')" "ROLE=cpu"
+   "$(MISSING_TAG=cpu-runner TAG=cpu-runner LABEL=cpu start_chain c6i.8xlarge OK | grep -oE '\(role [a-z0-9]+\)')" "(role cpu)"
 ck "provision hint names the role for cpu-runner3" \
-   "$(MISSING_TAG=cpu-runner3 TAG=cpu-runner3 LABEL=cpu start_chain c6i.8xlarge OK | grep -oE '\bROLE=[a-z0-9]+')" "ROLE=cpu3"
+   "$(MISSING_TAG=cpu-runner3 TAG=cpu-runner3 LABEL=cpu start_chain c6i.8xlarge OK | grep -oE '\(role [a-z0-9]+\)')" "(role cpu3)"
 
 # A CPU box brings its own ladder: none of the Ada shapes, and its current
 # shape is still tried first.
@@ -730,7 +728,7 @@ ck "and so does one that is refused"           "$(start_rc g6.xlarge DENY)" "1"
 # The ratchet. A box degraded by a past outage used to have no way back: the
 # chain began at CURRENT, so g6.xlarge was both where it started and the best it
 # would ever try. gpu-runner ran at a quarter of its configured size on this
-# path. The PreferredInstanceType tag provision.sh writes is what breaks it.
+# path. The PreferredInstanceType tag provisioning writes is what breaks it.
 ck "degraded box climbs back to its tag" \
    "$(PREFERRED_TAG=g6.4xlarge start_chain g6.xlarge OK)" \
    "::notice::i-gpu-runner is g6.xlarge but is configured for g6.4xlarge; a past capacity shortfall left it there. Trying g6.4xlarge first.|started gpu-runner as g6.4xlarge|"
@@ -748,8 +746,8 @@ ck "exhausts the ladder in order" \
 ck "a small box never grows past its tag" \
    "$(PREFERRED_TAG=g6.xlarge TAG=gpu-runner2 start_chain g6.xlarge CAP,CAP,CAP | tr '|' '\n' | tail -n 2 | head -n 1)" \
    "::warning::could not start i-gpu-runner2 as any of its shapes (tried: g6.xlarge g6e.xlarge)"
-# An untagged box -- one from outside this repo, since provision.sh tags every
-# box it starts -- walks the ladder down from wherever it is and nowhere else.
+# An untagged box -- one provisioned some other way, since provisioning tags
+# every box -- walks the ladder down from wherever it is and nowhere else.
 # With the ladder an input, the old fixed Ada tail is gone: it would have sent a
 # CPU box to a g6.
 ck "untagged box: down its ladder from where it is" \

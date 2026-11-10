@@ -57,7 +57,7 @@ for f in files:
         extracted += 1
 print(f"  extracted {extracted} run block(s), skipped {skipped}")
 # A skipped block is unlinted shell shipping to other repositories' CI, so
-# it fails here rather than only in test-multibox.sh. The fix is to pass the
+# it fails here rather than only downstream. The fix is to pass the
 # value in through `env:` instead of interpolating it into the body.
 sys.exit(1 if skipped else 0)
 PY

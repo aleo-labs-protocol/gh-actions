@@ -42,7 +42,7 @@
 # order, and each box steps down its own CapacityLadder tag. Provisioning
 # writes both from the box's config, so no caller lists the boxes.
 # StartInstances is still scoped by Name in IAM: a new box is started once
-# setup-oidc-role.sh has been re-run to admit it.
+# the start role's policy admits it.
 #
 # HOW MANY BOXES. Two terms, and the reason for each:
 #
@@ -256,7 +256,7 @@ jobs:
           # side counts EC2 instances. Two corrections get it there:
           #
           #   * a box with RUNNER_SLOTS > 1 registers one runner per slot, named
-          #     NAME-1, NAME-2 (runner-install.sh). Counting registrations would
+          #     NAME-1, NAME-2. Counting registrations would
           #     make one fully-busy box read as three and take `want` straight
           #     to the fleet cap -- every box started for a queue one box is
           #     already draining. Slots are pinned to 1 today, so this is a
@@ -443,14 +443,13 @@ jobs:
           # primary/overflow distinction.
           warn() { echo "::warning::$*"; }
 
-          # Seconds between rounds. A name so test-multibox.sh can set it to 0;
+          # Seconds between rounds. A name so a test can set it to 0;
           # only the throttle test, which measures it, sets it low instead.
           RETRY_SLEEP="${RETRY_SLEEP_SECONDS:-20}"
 
           # <class>-runner<n> is the role <class><n>: cpu-runner -> cpu,
           # gpu-runner2 -> gpu2. Stripping "-runner" alone leaves a third box as
-          # "cpu-runner3", a role lib.sh refuses -- the notice named a command
-          # that errors.
+          # "cpu-runner3", which is not a role.
           role_of() {
             case "$1" in
               *-runner|*-runner[0-9]*) printf '%s%s' "${1%-runner*}" "${1##*-runner}" ;;
@@ -573,7 +572,7 @@ jobs:
             match=$(awk -v t="${tag}" '$1 == t' <<<"${inv}")
             n=$(printf '%s' "${match}" | grep -c . || true)
             case "${n}" in
-              0) echo "::notice::no instance tagged ${tag}; that box is not provisioned (ROLE=$(role_of "${tag}") ./provision.sh)"
+              0) echo "::notice::no instance tagged ${tag}; that box is not provisioned (role $(role_of "${tag}"))"
                  continue ;;
               1) ;;
               *) warn "expected one instance tagged ${tag}, found ${n}; leaving it alone"
