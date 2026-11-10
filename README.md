@@ -242,8 +242,8 @@ only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
 
 `mirror-branches.yml` fast-forwards branches of a mirror repository, under the
 same owner, to the caller's. The use is a private copy of a public repository,
-such as `snarkOS-internal` for `snarkOS`, whose `staging` follows public
-`staging` and nothing else.
+such as `app-private` for `app`, whose `staging` follows public `staging` and
+nothing else.
 
 - Each listed branch in the mirror moves to where it is in the caller, and is
   created if the mirror lacks it.
@@ -275,11 +275,11 @@ jobs:
   mirror:
     # The mirror holds this file too. Without this, the bot's push there would
     # start a run in the mirror.
-    if: github.repository == 'aleo-labs-protocol/snarkOS'
+    if: github.repository == 'my-org/app'
     uses: aleo-labs-protocol/gh-actions/.github/workflows/mirror-branches.yml@v2
     permissions: { contents: read }
     with:
-      mirror: snarkOS-internal
+      mirror: app-private
       branches: staging
     secrets:
       MERGE_BOT_APP_KEY: ${{ secrets.MERGE_BOT_APP_KEY }}
@@ -307,7 +307,7 @@ schedules, releases and bumps. `disable-mirror-workflows.sh` disables every
 one but those named, by default `ci.yml`:
 
 ```sh
-./disable-mirror-workflows.sh aleo-labs-protocol/snarkOS-internal
+./disable-mirror-workflows.sh my-org/app-private
 ```
 
 A disabled workflow stays disabled when its file changes, but a new file arrives

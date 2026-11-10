@@ -7,8 +7,8 @@
 # that should run there, by base name; the default is ci.yml, so pull requests
 # in the mirror still get CI.
 #
-#   ./disable-mirror-workflows.sh aleo-labs-protocol/snarkOS-internal
-#   ./disable-mirror-workflows.sh aleo-labs-protocol/snarkVM-internal ci.yml gpu-test.yml
+#   ./disable-mirror-workflows.sh my-org/app-private
+#   ./disable-mirror-workflows.sh my-org/lib-private ci.yml gpu-test.yml
 #
 # Run it again after mirror-branches.yml warns of a new workflow. A disabled
 # workflow stays disabled when its file changes. GitHub lists a file only once

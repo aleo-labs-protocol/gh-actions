@@ -51,7 +51,7 @@ runs:
         set -euo pipefail
         if [ ! -x "${DISK_GUARD}" ]; then
           echo "::error::${DISK_GUARD} is missing or not executable. The box was" \
-               "provisioned without install-runner.sh, or an older version of it." >&2
+               "provisioned without the runner install, or an older version of it." >&2
           exit 1
         fi
         "${DISK_GUARD}" preflight "${RUNNER_WORKSPACE}"

@@ -3,7 +3,7 @@
 # settings put where a job-level `env:` cannot silently drop them, behind the
 # box's rustup lock. Everything else a job used to set up here -- NVCC, the
 # build parallelism -- is the box's to decide, and comes to the job through the
-# runner's .env (runner-install.sh).
+# runner's .env, which the runner install writes.
 #
 # Every step is gated on runner.environment, so a caller can leave this in a job
 # that sometimes runs on a hosted runner: there it does nothing.
@@ -42,7 +42,7 @@ runs:
   steps:
     # First, because the preflight below protects the directory this names.
     #
-    # CI_TARGET_ROOT is the box's: runner-install.sh sets it only where one slot
+    # CI_TARGET_ROOT is the box's: the runner install sets it only where one slot
     # makes a shared dir safe, so every job of a repository builds in one target
     # dir. Unset, it is a dir per job.
     - name: Target directory
@@ -100,11 +100,11 @@ runs:
         set -euo pipefail
         if [ ! -x "${DISK_GUARD}" ]; then
           echo "::error::${DISK_GUARD} is missing or not executable. The box was" \
-               "provisioned without install-runner.sh, or an older version of it." >&2
+               "provisioned without the runner install, or an older version of it." >&2
           exit 1
         fi
-        # The dir this job is about to fill. Since #33 protect orders rather
-        # than excludes, so this reads as "take mine last".
+        # The dir this job is about to fill. protect orders rather than
+        # excludes, so this reads as "take mine last".
         "${DISK_GUARD}" preflight "${CARGO_TARGET_DIR}"
 
     # The slots share one ~/.rustup, and the first cargo call installs
