@@ -443,7 +443,7 @@ jobs:
           # primary/overflow distinction.
           warn() { echo "::warning::$*"; }
 
-          # Seconds between rounds. A name so test-multibox.sh can set it to 0;
+          # Seconds between rounds. A name so test-boxes.sh can set it to 0;
           # only the throttle test, which measures it, sets it low instead.
           RETRY_SLEEP="${RETRY_SLEEP_SECONDS:-20}"
 
