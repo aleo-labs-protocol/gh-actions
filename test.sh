@@ -1809,7 +1809,9 @@ lk_crate() { # name version [dependency line...]
   printf '[package]\nname = "%s"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' "$1" "$2" > "$d/Cargo.toml"
   shift 2; printf '%s\n' "$@" >> "$d/Cargo.toml"
 }
-for v in 0.5.10 0.6.5 0.6.6 0.7.0; do lk_crate socket2 "$v"; done
+lk_crate libc 0.2.0
+lk_crate socket2 0.5.10 'libc = "0.2"'
+for v in 0.6.5 0.6.6 0.7.0; do lk_crate socket2 "$v"; done
 lk_crate hyper-util 0.1.20 'socket2 = ">=0.5, <0.7"'
 lk_crate quinn 0.11.0 'socket2 = ">=0.5, <0.7"'
 lk_crate tokio 1.0.0 'socket2 = "0.6"'
@@ -1829,15 +1831,36 @@ ck "cargo is on PATH"                "$(command -v cargo >/dev/null && echo yes)
 
 # cargo raised tokio's socket2 0.6.5 to 0.6.6 and relocked hyper-util to
 # 0.5.10. 0.7.0 is locked too, for mio, but is outside hyper-util's range.
-lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "mio 1.0.0 socket2 0.7.0" \
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "libc 0.2.0" "mio 1.0.0 socket2 0.7.0" \
         "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.5" \
-        "socket2 0.5.10" "socket2 0.6.5" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
-lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "mio 1.0.0 socket2 0.7.0" \
+        "socket2 0.5.10 libc" "socket2 0.6.5" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "libc 0.2.0" "mio 1.0.0 socket2 0.7.0" \
         "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.6" \
-        "socket2 0.5.10" "socket2 0.6.6" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.6" > "$lk_tmp/head.lock"
+        "socket2 0.5.10 libc" "socket2 0.6.6" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.6" > "$lk_tmp/head.lock"
 ck "raised: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" mio old-user tokio)" "0"
 ck "raised: to the lowest above"     "$(lk_deps hyper-util)" "socket2 0.6.6|"
 ck "raised: cargo agrees"            "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
+
+# old-user 1.0.1 no longer uses socket2 0.5.10, but cargo relocked hyper-util
+# and quinn to it. Moving both back leaves 0.5.10 unused, so cargo drops it and
+# the libc only it used, and names the one socket2 left by name alone.
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "libc 0.2.0" "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" \
+        "quinn 0.11.0 socket2 0.6.5" "socket2 0.5.10 libc" "socket2 0.6.5" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "libc 0.2.0" "old-user 1.0.1 hyper-util,quinn" \
+        "quinn 0.11.0 socket2 0.5.10" "socket2 0.5.10 libc" "socket2 0.6.5" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/head.lock"
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2" "old-user 1.0.1 hyper-util,quinn" \
+        "quinn 0.11.0 socket2" "socket2 0.6.5" "tokio 1.0.0 socket2" > "$lk_tmp/want.lock"
+ck "unused: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" old-user tokio)" "0"
+ck "unused: both moved back"         "$(lk_deps hyper-util)$(lk_deps quinn)" "socket2|socket2|"
+ck "unused: as cargo writes it"      "$(diff "$lk_tmp/want.lock" "$lk_ws/Cargo.lock")" ""
+cp "$lk_ws/Cargo.lock" "$lk_tmp/repaired.lock"
+ck "unused: cargo leaves it as is"   "$(lk_cargo metadata --format-version 1 >/dev/null 2>&1; diff "$lk_tmp/repaired.lock" "$lk_ws/Cargo.lock")" ""
+# A crate cargo cannot find offline fails every check, repaired or not.
+mv "$lk_ws/vendor/socket2-0.5.10" "$lk_tmp/"
+ck "offline failure: repair fails"   "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" old-user tokio)" "1"
+ck "offline failure: it says why"    "$(grep -c '^::error::\|socket2' "$lk_tmp/out")" "2"
+ck "offline failure: lock untouched" "$(diff "$lk_tmp/head.lock" "$lk_ws/Cargo.lock")" ""
+mv "$lk_tmp/socket2-0.5.10" "$lk_ws/vendor/"
 
 rm -rf "$lk_tmp"
 
