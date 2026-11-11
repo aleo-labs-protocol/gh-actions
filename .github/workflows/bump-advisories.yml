@@ -79,7 +79,7 @@ jobs:
           # stays locked but accepts a range, such as windows-sys
           # ">=0.52, <0.62", is then relocked to the lowest version already in
           # Cargo.lock that fits. `repair OLD` points each such edge back at its
-          # version in OLD, or the highest locked one above it. It fails if
+          # version in OLD, or the lowest locked one above it. It fails if
           # `cargo metadata --locked` rejects the lock before any repair. It
           # keeps the result if `cargo metadata --locked` accepts it, and otherwise keeps
           # each crate's repair that is accepted alone. `report BASE CHANGES
@@ -132,7 +132,8 @@ jobs:
                       if o and lower(o, n):
                           ups = [i[1] for i in ids if i[0] == name and i[2] == n[2] and key(i[1]) >= key(o[1])]
                           if ups:
-                              v = o[1] if o[1] in ups else max(ups, key=key)
+                              # A range that admits OLD's version and any of these admits the lowest.
+                              v = min(ups, key=key)
                               fixes.setdefault(parent, []).append((e, e.replace(f'{name} {n[1]}', f'{name} {v}', 1)))
 
               def apply(text, parent):

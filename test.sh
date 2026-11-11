@@ -1795,6 +1795,50 @@ lk_lock "app 0.1.0 hyper-util,old-user" "hyper-util 0.1.20 socket2 0.6.6" "old-u
 ck "report: up to a new version"     "$(lk_report "$lk_tmp/up.lock" "$lk_tmp/base.lock")" \
    '- `socket2` 0.6.5 → 0.6.6|#'
 
+# `repair` asks real cargo, offline, about a workspace whose crates.io is a
+# directory of empty crates. CARGO_HOME is empty, so no user config applies.
+lk_ws="$lk_tmp/ws"
+mkdir -p "$lk_ws/.cargo" "$lk_ws/app/src" "$lk_tmp/home"
+: > "$lk_ws/app/src/lib.rs"
+printf '[workspace]\nmembers = ["app"]\nresolver = "2"\n' > "$lk_ws/Cargo.toml"
+printf '[source.crates-io]\nreplace-with = "v"\n\n[source.v]\ndirectory = "vendor"\n' > "$lk_ws/.cargo/config.toml"
+lk_crate() { # name version [dependency line...]
+  local d="$lk_ws/vendor/$1-$2"
+  mkdir -p "$d/src"; : > "$d/src/lib.rs"
+  printf '{"files":{},"package":null}' > "$d/.cargo-checksum.json"
+  printf '[package]\nname = "%s"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' "$1" "$2" > "$d/Cargo.toml"
+  shift 2; printf '%s\n' "$@" >> "$d/Cargo.toml"
+}
+for v in 0.5.10 0.6.5 0.6.6 0.7.0; do lk_crate socket2 "$v"; done
+lk_crate hyper-util 0.1.20 'socket2 = ">=0.5, <0.7"'
+lk_crate quinn 0.11.0 'socket2 = ">=0.5, <0.7"'
+lk_crate tokio 1.0.0 'socket2 = "0.6"'
+lk_crate mio 1.0.0 'socket2 = "0.7"'
+lk_crate old-user 1.0.0 'hyper-util = "0.1"' 'quinn = "0.11"' 'socket2 = "0.5"'
+lk_crate old-user 1.0.1 'hyper-util = "0.1"' 'quinn = "0.11"'
+lk_cargo() { ( cd "$lk_ws" && CARGO_HOME="$lk_tmp/home" CARGO_NET_OFFLINE=true cargo "$@" ); }
+lk_repair() { # base lockfile, the lockfile cargo update wrote, app's dependencies -> exit code
+  printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' > "$lk_ws/app/Cargo.toml"
+  printf '%s = "*"\n' "${@:3}" >> "$lk_ws/app/Cargo.toml"
+  cp "$2" "$lk_ws/Cargo.lock"
+  ( cd "$lk_ws" && CARGO_HOME="$lk_tmp/home" CARGO_NET_OFFLINE=true python3 "$lk_tmp/lock.py" repair "$1" ) > "$lk_tmp/out" 2>&1
+  echo "$?"
+}
+lk_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "$lk_ws/Cargo.lock" | tr '\n' '|'; }
+ck "cargo is on PATH"                "$(command -v cargo >/dev/null && echo yes)" "yes"
+
+# cargo raised tokio's socket2 0.6.5 to 0.6.6 and relocked hyper-util to
+# 0.5.10. 0.7.0 is locked too, for mio, but is outside hyper-util's range.
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "mio 1.0.0 socket2 0.7.0" \
+        "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.5" \
+        "socket2 0.5.10" "socket2 0.6.5" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "mio 1.0.0 socket2 0.7.0" \
+        "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.6" \
+        "socket2 0.5.10" "socket2 0.6.6" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.6" > "$lk_tmp/head.lock"
+ck "raised: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" mio old-user tokio)" "0"
+ck "raised: to the lowest above"     "$(lk_deps hyper-util)" "socket2 0.6.6|"
+ck "raised: cargo agrees"            "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
+
 rm -rf "$lk_tmp"
 
 echo "== mirror-branches: fast-forward only =="
