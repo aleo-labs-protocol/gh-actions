@@ -373,7 +373,7 @@ ck "no \${{ }} in run bodies" "$(grep -c 'skip (contains' <<<"$lint_out")" "0"
 echo "== start-runner: capacity-fallback chain =="
 # Extracted from the real workflow YAML rather than hand-copied, so this cannot
 # drift from what ships. Callers run the chain with real cloud credentials, and
-# shellcheck can't see a chain that steps the wrong way; only running the
+# a static check can't see a chain that steps the wrong way; only running the
 # branches can.
 #
 # CAPACITY_RETRY_SECONDS=0 keeps this instant rather than mocking `sleep`: the
