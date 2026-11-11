@@ -442,6 +442,10 @@ start_rc() { start_chain "$@" >/dev/null; echo "${PIPESTATUS[0]}"; }
 ck "a stopped box is started" \
    "$(start_chain g6.xlarge OK)" \
    "started gpu-runner as g6.xlarge|"
+# A box left on a shape off its ladder is tried as itself, last.
+ck "an off-ladder current shape is the last resort" \
+   "$(PREFERRED_TAG=g6.xlarge start_chain g5.xlarge CAP,CAP,OK | tr '|' '\n' | grep '^started')" \
+   "started gpu-runner as g5.xlarge"
 ck "g6 exhausted -> g6e succeeds" \
    "$(start_chain g6.xlarge CAP,OK)" \
    "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
