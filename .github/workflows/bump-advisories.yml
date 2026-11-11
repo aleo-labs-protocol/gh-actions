@@ -79,8 +79,9 @@ jobs:
           # stays locked but accepts a range, such as windows-sys
           # ">=0.52, <0.62", is then relocked to the lowest version already in
           # Cargo.lock that fits. `repair OLD` points each such edge back at its
-          # version in OLD, or the highest locked one above it. It keeps the
-          # result if `cargo metadata --locked` accepts it, and otherwise keeps
+          # version in OLD, or the highest locked one above it. It fails if
+          # `cargo metadata --locked` rejects the lock before any repair. It
+          # keeps the result if `cargo metadata --locked` accepts it, and otherwise keeps
           # each crate's repair that is accepted alone. `report BASE CHANGES
           # DOWNGRADES` lists what changed since BASE, and the dependencies that
           # moved to a lower version.
@@ -151,11 +152,17 @@ jobs:
 
               def accepted(text):
                   open('Cargo.lock', 'w').write(text)
-                  return subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                  r = subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                  if r.returncode:
+                      print(r.stderr.rstrip(), file=sys.stderr)
+                  return r.returncode == 0
 
               if not fixes:
                   return
+              # A lock cargo rejects as written would make every repair look rejected.
+              if not accepted(text):
+                  sys.exit('::error::cargo metadata --locked --offline fails on the lock cargo update wrote')
               if accepted(reduce(apply, fixes, text)):
                   for parent in fixes:
                       log('repaired', parent)

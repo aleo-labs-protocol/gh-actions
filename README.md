@@ -334,7 +334,8 @@ requests need not gate on advisories published after they were opened.
   a range, such as `windows-sys = ">=0.52, <0.62"`, can then move to a lower
   version that is already in `Cargo.lock`. After each update the workflow moves
   such edges back. It keeps a crate's repair only if `cargo metadata --locked`
-  accepts the result.
+  accepts the result. It fails if `cargo metadata --locked` rejects the lock
+  before any repair, since every repair would then look rejected.
 - The pull request lists each version and dependency change from the target.
   It lists separately each dependency left on a lower version.
 - Once the branch's tip is a commit that someone other than the App wrote or

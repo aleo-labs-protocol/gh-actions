@@ -1474,7 +1474,8 @@ ba_step() { # step name, env assignments -> its exit code
 # moves errno's and hyper-util's edges to the lower versions old-user holds, as
 # cargo does to the dependencies of the crate it updates; with BA_RAISE, it
 # raises socket2 0.6.5 to 0.6.6 first. `cargo metadata
-# --locked` rejects the lockfile once BA_REJECT's edge to socket2 0.6.5 is back.
+# --locked` rejects the lockfile once BA_REJECT's edge to socket2 0.6.5 is back,
+# and any lockfile with BA_OFFLINE, as when a crate is missing offline.
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
 case "$*" in
@@ -1491,7 +1492,9 @@ case "$*" in
   fetch) rm -f "$BA_TMP/unfetched";;
   "metadata --locked --offline --format-version 1")
     [ -e "$BA_TMP/unfetched" ] && { echo "error: --offline was specified" >&2; exit 1; }
-    ! sed -n "/^name = \"${BA_REJECT:-}\"\$/,/^\$/p" Cargo.lock | grep -q '"socket2 0.6.5"';;
+    [ -n "${BA_OFFLINE:-}" ] && { echo "error: no matching package named \`zip\` found" >&2; exit 1; }
+    ! sed -n "/^name = \"${BA_REJECT:-}\"\$/,/^\$/p" Cargo.lock | grep -q '"socket2 0.6.5"' \
+      || { echo "error: cannot update the lock file because --locked was passed" >&2; exit 1; };;
   "deny --format json check advisories"|"deny --offline --format json check advisories")
     [ "$2" = --offline ] && [ -e "$BA_TMP/unfetched" ] \
       && { echo "error: failed to download \`$3\`: --offline was specified" >&2; exit 1; }
@@ -1642,6 +1645,9 @@ ck "rejected: the downgrades"        "$(ba_out downgrades)" \
    '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|- `hyper-util 0.1.20` depends on `windows-sys` 0.52.0, not 0.61.2|'
 ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "2"
 ck "rejected: still fixed"           "$(ba_ids fixed)" "$ba_all"
+ck "rejected: cargo's error is shown" "$(grep -c '^error: cannot update the lock file' "$ba_tmp/out")" "2"
+ck "cargo fails anyway: the step fails" "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_OFFLINE=1)" "1"
+ck "cargo fails anyway: it says why" "$(grep -c '^error: no matching package\|^::error::cargo metadata' "$ba_tmp/out")" "2"
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
 ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
 
