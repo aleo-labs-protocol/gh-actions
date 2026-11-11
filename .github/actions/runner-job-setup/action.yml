@@ -1,18 +1,18 @@
 # What a job does on a self-hosted box before its own build starts: the disk
 # preflight, a target directory that survives checkout, and the box's sccache
-# settings put where a job-level `env:` cannot silently drop them, behind the
-# box's rustup lock. Everything else a job used to set up here -- NVCC, the
-# build parallelism -- is the box's to decide, and comes to the job through the
-# runner's .env, which the runner install writes.
+# settings put where a job-level `env:` cannot silently drop them. Everything
+# else -- NVCC, the build parallelism -- is the box's to decide, and comes to the
+# job through the runner's .env, which the runner install writes.
 #
 # Every step is gated on runner.environment, so a caller can leave this in a job
 # that sometimes runs on a hosted runner: there it does nothing.
 #
 # The disk step is NOT identical to gpu-runner-preflight's: this one protects
 # the target dir it just named, which where the box sets CI_TARGET_ROOT is
-# shared and lives outside the work root, while gpu-test keeps its target beside the checkout so
-# protecting the work root covers it. The test pins what must stay aligned --
-# the guard path and the missing-guard refusal -- rather than the whole step.
+# shared and lives outside the work root, while gpu-test keeps its target beside
+# the checkout, so protecting the work root covers it. The test pins what must
+# stay aligned -- the guard path and the missing-guard refusal -- rather than
+# the whole step.
 name: Runner job setup
 description: Disk preflight, a persistent target dir and sccache, on a self-hosted box only.
 
@@ -106,12 +106,3 @@ runs:
         # The dir this job is about to fill. protect orders rather than
         # excludes, so this reads as "take mine last".
         "${DISK_GUARD}" preflight "${CARGO_TARGET_DIR}"
-
-    # Runners on one box share one ~/.rustup, and the first cargo call installs
-    # rust-toolchain.toml's channel if it is missing. Serialised, so jobs
-    # starting together do not race into the same toolchain dir -- and one
-    # lock name for every repository on the box, since ~/.rustup is per box.
-    - name: Rustup lock
-      if: runner.environment == 'self-hosted'
-      shell: bash
-      run: flock /tmp/rustup.lock cargo --version

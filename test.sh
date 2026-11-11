@@ -259,12 +259,12 @@ for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-re
   ck "$a action exists" "$([[ -f "$REPO/.github/actions/$a/action.yml" ]] && echo yes || echo no)" "yes"
   ck "$a is composite"  "$(grep -c 'using: composite' "$REPO/.github/actions/$a/action.yml")" "1"
 done
-# The two preflights protect different things now, deliberately: job-setup
-# protects the target dir it just named, which where the box sets CI_TARGET_ROOT
-# is shared by every job of the repository and lives outside the work root; gpu-test keeps
-# its target beside the checkout, so gpu-runner-preflight protects the work
-# root and covers it. What must stay aligned is the guard path and the
-# missing-guard error, so those are pinned rather than the whole step.
+# The two preflights protect different things, deliberately: job-setup protects
+# the target dir it just named, which where the box sets CI_TARGET_ROOT is shared
+# by every job of the repository and lives outside the work root; gpu-test keeps
+# its target beside the checkout, so gpu-runner-preflight protects the work root
+# and covers it. What must stay aligned is the guard path and the missing-guard
+# error, so those are pinned rather than the whole step.
 ck "job setup falls back to a dir per job without it" \
    "$(grep -cF 'target="${RUNNER_WORKSPACE}/${TARGET_NAME}-target"' "$REPO/.github/actions/runner-job-setup/action.yml")" "1"
 ck "and shares one dir per repo with it" \
@@ -290,7 +290,6 @@ ck "both refuse a box with no guard" \
 # Inert on a hosted runner: every step is gated on the box.
 ck "job setup gates every step on the box" \
    "$(f="$REPO/.github/actions/runner-job-setup/action.yml"; [[ $(grep -c "if: runner.environment == 'self-hosted'" "$f") == $(grep -c '^    - name:' "$f") ]] && echo yes || echo no)" "yes"
-ck "job setup takes the box's rustup lock" "$(grep -c 'flock /tmp/rustup.lock cargo --version' "$REPO/.github/actions/runner-job-setup/action.yml")" "1"
 
 # The sccache four, re-asserted through GITHUB_ENV. Run rather than
 # grepped, because what matters is which names come out and where they come
@@ -373,11 +372,9 @@ ck "no \${{ }} in run bodies" "$(grep -c 'skip (contains' <<<"$lint_out")" "0"
 
 echo "== start-runner: capacity-fallback chain =="
 # Extracted from the real workflow YAML rather than hand-copied, so this cannot
-# drift from what actually ships. The chain has been rewritten three times in a
-# day -- immutable OIDC subjects, the capacity retry, and a fallback whose target
-# had silently become its own source -- and it is consumed
-# by two other repositories' CI with real AWS credentials. shellcheck cannot see
-# any of these bugs; only running the branches can.
+# drift from what ships. Callers run the chain with real cloud credentials, and
+# shellcheck can't see a chain that steps the wrong way; only running the
+# branches can.
 #
 # CAPACITY_RETRY_SECONDS=0 keeps this instant rather than mocking `sleep`: the
 # deadline is checked after each round, so exactly one round runs and one
@@ -444,8 +441,8 @@ ck "a stopped box is started" \
    "started gpu-runner as g6.xlarge|"
 # A box left on a shape off its ladder is tried as itself, last.
 ck "an off-ladder current shape is the last resort" \
-   "$(PREFERRED_TAG=g6.xlarge start_chain g5.xlarge CAP,CAP,OK | tr '|' '\n' | grep '^started')" \
-   "started gpu-runner as g5.xlarge"
+   "$(PREFERRED_TAG=g6.xlarge start_chain g5.xlarge CAP,CAP,OK)" \
+   "::notice::i-gpu-runner is g5.xlarge but is configured for g6.xlarge; a past capacity shortfall left it there. Trying g6.xlarge first.|started gpu-runner as g5.xlarge|::warning::gpu-runner started as g5.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
 ck "g6 exhausted -> g6e succeeds" \
    "$(start_chain g6.xlarge CAP,OK)" \
    "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
@@ -934,11 +931,9 @@ echo "== gpu-runner-preflight: which GPU it decides it landed on =="
 # step is consumed by two other repositories, and its whole job is to classify a
 # string nobody here can see until a job lands on unfamiliar hardware.
 #
-# It failed the one case it existed for. When the driver is not loaded,
-# nvidia-smi exits 9, and the step reported "Process completed with exit
-# code 9" and nothing else -- because nvidia-smi prints its explanation to
-# STDOUT, straight into a command substitution that was never echoed. Finding
-# that took an EC2 console-log dump (#10). Mocking nvidia-smi is the only way to
+# When the driver is not loaded, nvidia-smi exits 9 and prints its explanation
+# to STDOUT, so the step has to echo what it captured or the job says only
+# "Process completed with exit code 9". Mocking nvidia-smi is the only way to
 # run these branches without the hardware.
 PF="$REPO/.github/actions/gpu-runner-preflight/action.yml"
 pf_tmp="$(mktemp -d)"; mkdir -p "$pf_tmp/bin"
