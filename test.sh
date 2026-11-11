@@ -1644,14 +1644,16 @@ ck "raised: socket2 is a change"     "$(ba_out changes)" '- `socket2` 0.6.5 → 
 ck "raised: no downgrades"           "$(ba_out downgrades)" ""
 ck "rejected: the step succeeds"     "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_REJECT=hyper-util)" "0"
 ck "rejected: errno is repaired"     "$(ba_deps errno)" "windows-sys 0.61.2|"
-ck "rejected: hyper-util is not"     "$(ba_deps hyper-util)" "socket2 0.5.10|windows-sys 0.52.0|"
+ck "rejected: only its socket2 edge" "$(ba_deps hyper-util)" "socket2 0.5.10|windows-sys 0.61.2|"
 ck "rejected: the downgrades"        "$(ba_out downgrades)" \
-   '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|- `hyper-util 0.1.20` depends on `windows-sys` 0.52.0, not 0.61.2|'
-ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "2"
+   '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|'
+ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "1"
 ck "rejected: still fixed"           "$(ba_ids fixed)" "$ba_all"
 ck "rejected: cargo's move is shown" "$(grep -c "^cargo resolves hyper-util 0.1.20's socket2 to 0.5.10, not 0.6.5" "$ba_tmp/out")" "2"
-ck "cargo fails anyway: the step fails" "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_OFFLINE=1)" "1"
-ck "cargo fails anyway: it says why" "$(grep -c '^error: no matching package\|^::error::cargo metadata' "$ba_tmp/out")" "2"
+ck "cargo fails anyway: the step succeeds" "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_OFFLINE=1)" "0"
+ck "cargo fails anyway: it says why" "$(for m in '^error: no matching package' '^cargo metadata --locked --offline fails' '^::warning::lock.py repair failed after cargo update -p zip@8.6.0,'; do grep -q "$m" "$ba_tmp/out" && printf y; done)" "yyy"
+ck "cargo fails anyway: zip stays"   "$(git -C "$ba_tmp/work" diff --quiet -- Cargo.lock; echo $?)" "0"
+ck "cargo fails anyway: all left"    "$(ba_ids after)" "$ba_all"
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
 ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
 
@@ -1729,8 +1731,8 @@ ck "a rewritten commit: comments too" "$(ba_publish BA_PR=5 BA_SHA=0123 BA_COMMI
 ck "the same lock: no comment either" "$(ba_publish BA_PR=5 BA_SHA="$(git -C "$ba_tmp/work" hash-object Cargo.lock)" BA_HUMAN=alice)$(ba_log)" "0"
 ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_REJECT=hyper-util >/dev/null
 ck "rejected: the step succeeds"     "$(ba_publish)" "0"
-ck "rejected: the body warns"        "$(grep -c '^- `hyper-util 0.1.20` depends on' "$ba_tmp/body.pr-create")" "4"
-ck "rejected: in its own list"       "$(sed -n '/could not move them back/,/^Opened by/p' "$ba_tmp/body.pr-create" | grep -c '^- ')" "2"
+ck "rejected: the body warns"        "$(grep -c '^- `hyper-util 0.1.20` depends on' "$ba_tmp/body.pr-create")" "2"
+ck "rejected: in its own list"       "$(sed -n '/could not move them back/,/^Opened by/p' "$ba_tmp/body.pr-create" | grep -c '^- ')" "1"
 ck "rejected: then a blank line"    "$(grep -B1 "^Opened by" "$ba_tmp/body.pr-create" | head -1)" ""
 
 ba_bump BA_FIX=nothing >/dev/null
@@ -1798,6 +1800,11 @@ lk_lock "app 0.1.0 hyper-util,old-user" "hyper-util 0.1.20 socket2 0.6.6" "old-u
         "socket2 0.5.10" "socket2 0.6.6" > "$lk_tmp/up.lock"
 ck "report: up to a new version"     "$(lk_report "$lk_tmp/up.lock" "$lk_tmp/base.lock")" \
    '- `socket2` 0.6.5 → 0.6.6|#'
+# cargo replaced socket2 0.6.5 with 0.5.10: one downgrade line, not one per user.
+lk_lock "app 0.1.0 hyper-util" "hyper-util 0.1.20 socket2" "socket2 0.6.5" > "$lk_tmp/one.lock"
+lk_lock "app 0.1.0 hyper-util" "hyper-util 0.1.20 socket2" "socket2 0.5.10" > "$lk_tmp/one-down.lock"
+ck "report: one version replaced"    "$(lk_report "$lk_tmp/one-down.lock" "$lk_tmp/one.lock")" \
+   '- `socket2` 0.6.5 → 0.5.10|#- `socket2` 0.6.5 → 0.5.10|'
 
 # `repair` asks real cargo, offline, about a workspace whose crates.io is a
 # directory of empty crates. CARGO_HOME is empty, so no user config applies.
@@ -1815,7 +1822,11 @@ lk_crate() { # name version [dependency line...]
 }
 lk_crate libc 0.2.0
 lk_crate socket2 0.5.10 'libc = "0.2"'
-for v in 0.6.5 0.6.6 0.7.0; do lk_crate socket2 "$v"; done
+for v in 0.6.5 0.6.6 0.7.0 0.7.1-beta.1 0.8.0; do lk_crate socket2 "$v"; done
+lk_crate beta-user 1.0.0 'socket2 = "=0.7.1-beta.1"'
+lk_crate eight-user 1.0.0 'socket2 = "0.8"'
+lk_crate five-user 1.0.0 'socket2 = "0.5"'
+lk_crate wide-user 1.0.0 'socket2 = ">=0.5, <0.9"'
 lk_crate hyper-util 0.1.20 'socket2 = ">=0.5, <0.7"'
 lk_crate quinn 0.11.0 'socket2 = ">=0.5, <0.7"'
 lk_crate tokio 1.0.0 'socket2 = "0.6"'
@@ -1845,6 +1856,19 @@ ck "raised: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/h
 ck "raised: to the lowest above"     "$(lk_deps hyper-util)" "socket2 0.6.6|"
 ck "raised: cargo agrees"            "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
 
+# cargo relocked wide-user to socket2 0.5.10 and dropped 0.6.5. The lowest
+# locked version above 0.6.5 is a pre-release that wide-user's range does not
+# admit; 0.8.0 is above it and admitted.
+lk_lock "app 0.1.0 beta-user,eight-user,five-user,wide-user" "beta-user 1.0.0 socket2 0.7.1-beta.1" \
+        "eight-user 1.0.0 socket2 0.8.0" "five-user 1.0.0 socket2 0.5.10" "libc 0.2.0" "socket2 0.5.10 libc" \
+        "socket2 0.6.5" "socket2 0.7.1-beta.1" "socket2 0.8.0" "wide-user 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 beta-user,eight-user,five-user,wide-user" "beta-user 1.0.0 socket2 0.7.1-beta.1" \
+        "eight-user 1.0.0 socket2 0.8.0" "five-user 1.0.0 socket2 0.5.10" "libc 0.2.0" "socket2 0.5.10 libc" \
+        "socket2 0.7.1-beta.1" "socket2 0.8.0" "wide-user 1.0.0 socket2 0.5.10" > "$lk_tmp/head.lock"
+ck "pre-release: repair succeeds"    "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" beta-user eight-user five-user wide-user)" "0"
+ck "pre-release: skipped"            "$(lk_deps wide-user)" "socket2 0.8.0|"
+ck "pre-release: cargo agrees"       "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
+
 # old-user 1.0.1 no longer uses socket2 0.5.10, but cargo relocked hyper-util
 # and quinn to it. Moving both back leaves 0.5.10 unused, so cargo drops it and
 # the libc only it used, and names the one socket2 left by name alone.
@@ -1862,7 +1886,7 @@ ck "unused: cargo leaves it as is"   "$(lk_cargo metadata --format-version 1 >/d
 # A crate cargo cannot find offline fails every check, repaired or not.
 mv "$lk_ws/vendor/socket2-0.5.10" "$lk_tmp/"
 ck "offline failure: repair fails"   "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" old-user tokio)" "1"
-ck "offline failure: it says why"    "$(grep -c '^::error::\|socket2' "$lk_tmp/out")" "2"
+ck "offline failure: it says why"    "$(grep -c '^cargo metadata --locked --offline fails' "$lk_tmp/out")" "1"
 ck "offline failure: lock untouched" "$(diff "$lk_tmp/head.lock" "$lk_ws/Cargo.lock")" ""
 mv "$lk_tmp/socket2-0.5.10" "$lk_ws/vendor/"
 
