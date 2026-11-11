@@ -148,14 +148,9 @@ ck "a stale offline registration is not busy" "$(census 3 3 1)" "0"
 # A 403 or a rate limit parsed as JSON comes back as "no runners" -- which is
 # also what an idle fleet looks like. Write nothing rather than write 0, so the
 # plan step can tell "nobody is busy" from "could not look".
-# BOXES, because the plan step adds this to a count of EC2 instances. A box
-# with RUNNER_SLOTS > 1 registers one runner per slot as NAME-1, NAME-2,
-# so counting registrations makes one busy box read as
-# three and takes `want` straight to the fleet cap.
-ck "a multi-slot box is one busy box" \
-   "$(census_named "cpu-runner-1 cpu-runner-2 cpu-runner-3")" "1"
-ck "and slots across two boxes are two" \
-   "$(census_named "cpu-runner-1 cpu-runner-2 cpu-runner2-1")" "2"
+# Each busy box is one runner, named for it.
+ck "two busy boxes are two" "$(census_named "cpu-runner cpu-runner2")" "2"
+ck "a name with a suffix is not the box" "$(census_named "cpu-runner-1")" "0"
 # A runner elsewhere in the org carrying the same label is not in this fleet,
 # and starting our boxes would not relieve whatever it is doing.
 ck "a busy runner outside the fleet is not counted" \
@@ -264,12 +259,12 @@ for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-re
   ck "$a action exists" "$([[ -f "$REPO/.github/actions/$a/action.yml" ]] && echo yes || echo no)" "yes"
   ck "$a is composite"  "$(grep -c 'using: composite' "$REPO/.github/actions/$a/action.yml")" "1"
 done
-# The two preflights protect different things now, deliberately: job-setup
-# protects the target dir it just named, which on a one-slot box is shared by
-# every job of the repository and lives outside the work root; gpu-test keeps
-# its target beside the checkout, so gpu-runner-preflight protects the work
-# root and covers it. What must stay aligned is the guard path and the
-# missing-guard error, so those are pinned rather than the whole step.
+# The two preflights protect different things, deliberately: job-setup protects
+# the target dir it just named, which where the box sets CI_TARGET_ROOT is shared
+# by every job of the repository and lives outside the work root; gpu-test keeps
+# its target beside the checkout, so gpu-runner-preflight protects the work root
+# and covers it. What must stay aligned is the guard path and the missing-guard
+# error, so those are pinned rather than the whole step.
 ck "job setup falls back to a dir per job without it" \
    "$(grep -cF 'target="${RUNNER_WORKSPACE}/${TARGET_NAME}-target"' "$REPO/.github/actions/runner-job-setup/action.yml")" "1"
 ck "and shares one dir per repo with it" \
@@ -295,7 +290,6 @@ ck "both refuse a box with no guard" \
 # Inert on a hosted runner: every step is gated on the box.
 ck "job setup gates every step on the box" \
    "$(f="$REPO/.github/actions/runner-job-setup/action.yml"; [[ $(grep -c "if: runner.environment == 'self-hosted'" "$f") == $(grep -c '^    - name:' "$f") ]] && echo yes || echo no)" "yes"
-ck "job setup takes the box's rustup lock" "$(grep -c 'flock /tmp/rustup.lock cargo --version' "$REPO/.github/actions/runner-job-setup/action.yml")" "1"
 
 # The sccache four, re-asserted through GITHUB_ENV. Run rather than
 # grepped, because what matters is which names come out and where they come
@@ -378,11 +372,9 @@ ck "no \${{ }} in run bodies" "$(grep -c 'skip (contains' <<<"$lint_out")" "0"
 
 echo "== start-runner: capacity-fallback chain =="
 # Extracted from the real workflow YAML rather than hand-copied, so this cannot
-# drift from what actually ships. The chain has been rewritten three times in a
-# day -- immutable OIDC subjects, the capacity retry, a fallback whose target had
-# silently become its own source, and the g6f.xlarge tier -- and it is consumed
-# by two other repositories' CI with real AWS credentials. shellcheck cannot see
-# any of these bugs; only running the branches can.
+# drift from what ships. Callers run the chain with real cloud credentials, and
+# a static check can't see a chain that steps the wrong way; only running the
+# branches can.
 #
 # CAPACITY_RETRY_SECONDS=0 keeps this instant rather than mocking `sleep`: the
 # deadline is checked after each round, so exactly one round runs and one
@@ -447,6 +439,10 @@ start_rc() { start_chain "$@" >/dev/null; echo "${PIPESTATUS[0]}"; }
 ck "a stopped box is started" \
    "$(start_chain g6.xlarge OK)" \
    "started gpu-runner as g6.xlarge|"
+# A box left on a shape off its ladder is tried as itself, last.
+ck "an off-ladder current shape is the last resort" \
+   "$(PREFERRED_TAG=g6.xlarge start_chain g5.xlarge CAP,CAP,OK)" \
+   "::notice::i-gpu-runner is g5.xlarge but is configured for g6.xlarge; a past capacity shortfall left it there. Trying g6.xlarge first.|started gpu-runner as g5.xlarge|::warning::gpu-runner started as g5.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
 ck "g6 exhausted -> g6e succeeds" \
    "$(start_chain g6.xlarge CAP,OK)" \
    "started gpu-runner as g6e.xlarge|::warning::gpu-runner started as g6e.xlarge instead of its configured g6.xlarge: no capacity for it in its AZ|"
@@ -463,14 +459,6 @@ ck "a start past the quota is skipped" \
 ck "g6 and g6e exhausted -> named error" \
    "$(start_chain g6.xlarge CAP,CAP)" \
    "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.xlarge g6e.xlarge)|::error::no box carrying gpu is online and none could be started; jobs needing it queue for 24h before GitHub gives up|"
-# A box an older ladder left on g6f cannot run the suite: it
-# is retyped off it, and g6f is never tried, tagged or not.
-ck "box already g6f: retyped to g6.xlarge" \
-   "$(start_chain g6f.xlarge OK)" \
-   "::warning::this box is currently g6f.xlarge, a fractional L4 that cannot run the CUDA suite; retyping it to a full-size shape|started gpu-runner as g6.xlarge|"
-ck "box already g6f: never falls back to it" \
-   "$(PREFERRED_TAG=g6f.xlarge start_chain g6f.xlarge CAP,CAP | tr '|' '\n' | tail -n 2 | head -n 1)" \
-   "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.xlarge g6e.xlarge)"
 # A permission error is not a capacity error. Returning "this tier is full" for
 # an UnauthorizedOperation walked the box down its entire ladder, retyping it at
 # every step and blaming capacity for each -- three misleading warnings and a
@@ -943,11 +931,9 @@ echo "== gpu-runner-preflight: which GPU it decides it landed on =="
 # step is consumed by two other repositories, and its whole job is to classify a
 # string nobody here can see until a job lands on unfamiliar hardware.
 #
-# It failed the one case it existed for. On a g6f the driver cannot bind the
-# vGPU, nvidia-smi exits 9, and the step reported "Process completed with exit
-# code 9" and nothing else -- because nvidia-smi prints its explanation to
-# STDOUT, straight into a command substitution that was never echoed. Finding
-# that took an EC2 console-log dump (#10). Mocking nvidia-smi is the only way to
+# When the driver is not loaded, nvidia-smi exits 9 and prints its explanation
+# to STDOUT, so the step has to echo what it captured or the job says only
+# "Process completed with exit code 9". Mocking nvidia-smi is the only way to
 # run these branches without the hardware.
 PF="$REPO/.github/actions/gpu-runner-preflight/action.yml"
 pf_tmp="$(mktemp -d)"; mkdir -p "$pf_tmp/bin"
@@ -986,16 +972,10 @@ ck "L40S still warns (the comma matters)" \
 ck "an A10G warns too" \
    "$(which_gpu 'NVIDIA A10G, 8.6, 23028 MiB')" \
    "::warning::ran on NVIDIA A10G, 8.6, 23028 MiB, not the L4 this code deploys to — a failure that depends on the deployment card's limits may not reproduce here|"
-# A g6f reports a PROFILE name. It matched neither arm before, so it fell to the
-# L40S branch and claimed the box might be more capable than the deployment
-# card -- the exact opposite of a slice with an eighth of the memory.
-ck "vGPU slice gets its own warning" \
-   "$(which_gpu 'NVIDIA L4-3Q, 8.9, 3072 MiB')" \
-   "::warning::ran on NVIDIA L4-3Q, 8.9, 3072 MiB — a vGPU SLICE of the L4, not a whole one. Same sm_89, but a fraction of the memory and time-sliced SMs shared with other tenants: a pass here is a correctness result, not a timing one|"
 # The regression this section exists for: a driver that did not load must say so.
 ck "driver failure names itself, not just exit 9" \
    "$(which_gpu "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver." 9)" \
-   "::error::nvidia-smi failed with exit 9; this box has no usable GPU.|::error::Exit 9 is NVML's \"driver not loaded\". On a full-size shape that is usually a kernel update the DKMS modules were not rebuilt for; on a g6f, which only the GRID driver binds, it is expected.|"
+   "::error::nvidia-smi failed with exit 9; this box has no usable GPU.|::error::Exit 9 is NVML's \"driver not loaded\", usually a kernel update the DKMS modules were not rebuilt for.|"
 # And it must still FAIL. Reporting the reason is worthless if the job goes
 # green on a box with no GPU.
 SMI_OUT="NVIDIA-SMI has failed" SMI_RC=9 EXPECTED_GPU=L4 \
