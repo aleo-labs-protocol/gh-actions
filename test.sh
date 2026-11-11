@@ -1473,9 +1473,10 @@ ba_step() { # step name, env assignments -> its exit code
 # `cargo deny --offline` fails until `cargo fetch` runs. With BA_FLIP, it also
 # moves errno's and hyper-util's edges to the lower versions old-user holds, as
 # cargo does to the dependencies of the crate it updates; with BA_RAISE, it
-# raises socket2 0.6.5 to 0.6.6 first. `cargo metadata
-# --locked` rejects the lockfile once BA_REJECT's edge to socket2 0.6.5 is back,
-# and any lockfile with BA_OFFLINE, as when a crate is missing offline.
+# raises socket2 0.6.5 to 0.6.6 first. `cargo metadata` drops the source from
+# each entry, and moves BA_REJECT's edge to socket2 0.6.5 back to 0.5.10, as
+# cargo does to an edge outside its range. `cargo metadata --locked` rejects
+# any lockfile with BA_OFFLINE, as when a crate is missing offline.
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
 case "$*" in
@@ -1490,11 +1491,14 @@ case "$*" in
     printf '\n# %s\n' "$3" >> Cargo.lock
     touch "$BA_TMP/unfetched";;
   fetch) rm -f "$BA_TMP/unfetched";;
-  "metadata --locked --offline --format-version 1")
+  "metadata --locked --offline --format-version 1"|"metadata --offline --format-version 1")
     [ -e "$BA_TMP/unfetched" ] && { echo "error: --offline was specified" >&2; exit 1; }
     [ -n "${BA_OFFLINE:-}" ] && { echo "error: no matching package named \`zip\` found" >&2; exit 1; }
-    ! sed -n "/^name = \"${BA_REJECT:-}\"\$/,/^\$/p" Cargo.lock | grep -q '"socket2 0.6.5"' \
-      || { echo "error: cannot update the lock file because --locked was passed" >&2; exit 1; };;
+    [ "$2" = --locked ] && exit 0
+    sed -i 's/^ "\([^ "]* [^ "]*\) ([^)]*)",$/ "\1",/' Cargo.lock
+    if [ -n "${BA_REJECT:-}" ]; then
+      sed -i "/^name = \"$BA_REJECT\"\$/,/^\$/s/\"socket2 0.6.5\"/\"socket2 0.5.10\"/" Cargo.lock
+    fi;;
   "deny --format json check advisories"|"deny --offline --format json check advisories")
     [ "$2" = --offline ] && [ -e "$BA_TMP/unfetched" ] \
       && { echo "error: failed to download \`$3\`: --offline was specified" >&2; exit 1; }
@@ -1607,7 +1611,7 @@ ba_bump() { # env assignments -> the step's exit code
 }
 ba_ids() { cut -f1 "$ba_tmp/runner/bump-advisories/$1" | tr '\n' ' '; }
 ba_out() { tr '\n' '|' < "$ba_tmp/runner/bump-advisories/$1"; }
-ba_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "$ba_tmp/work/Cargo.lock" | tr '\n' '|'; }
+ba_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "${2:-$ba_tmp/work/Cargo.lock}" | tr '\n' '|'; }
 ba_all="RUSTSEC-2026-0367 RUSTSEC-2026-0368 RUSTSEC-2026-0369 "
 ck "clean: the step succeeds"        "$(ba_bump BA_CLEAN=1)" "0"
 ck "clean: nothing updated"          "$(cat "$ba_tmp/log")" ""
@@ -1645,7 +1649,7 @@ ck "rejected: the downgrades"        "$(ba_out downgrades)" \
    '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|- `hyper-util 0.1.20` depends on `windows-sys` 0.52.0, not 0.61.2|'
 ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "2"
 ck "rejected: still fixed"           "$(ba_ids fixed)" "$ba_all"
-ck "rejected: cargo's error is shown" "$(grep -c '^error: cannot update the lock file' "$ba_tmp/out")" "2"
+ck "rejected: cargo's move is shown" "$(grep -c "^cargo resolves hyper-util 0.1.20's socket2 to 0.5.10, not 0.6.5" "$ba_tmp/out")" "2"
 ck "cargo fails anyway: the step fails" "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_OFFLINE=1)" "1"
 ck "cargo fails anyway: it says why" "$(grep -c '^error: no matching package\|^::error::cargo metadata' "$ba_tmp/out")" "2"
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
@@ -1826,7 +1830,7 @@ lk_repair() { # base lockfile, the lockfile cargo update wrote, app's dependenci
   ( cd "$lk_ws" && CARGO_HOME="$lk_tmp/home" CARGO_NET_OFFLINE=true python3 "$lk_tmp/lock.py" repair "$1" ) > "$lk_tmp/out" 2>&1
   echo "$?"
 }
-lk_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "$lk_ws/Cargo.lock" | tr '\n' '|'; }
+lk_deps() { ba_deps "$1" "$lk_ws/Cargo.lock"; }
 ck "cargo is on PATH"                "$(command -v cargo >/dev/null && echo yes)" "yes"
 
 # cargo raised tokio's socket2 0.6.5 to 0.6.6 and relocked hyper-util to
