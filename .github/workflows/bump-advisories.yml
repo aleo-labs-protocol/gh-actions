@@ -79,14 +79,17 @@ jobs:
           # stays locked but accepts a range, such as windows-sys
           # ">=0.52, <0.62", is then relocked to the lowest version already in
           # Cargo.lock that fits. `repair OLD` points each such edge back at its
-          # version in OLD, or the highest locked one above it. It keeps the
-          # result if `cargo metadata --locked` accepts it, and otherwise keeps
-          # each crate's repair that is accepted alone. `report BASE CHANGES
-          # DOWNGRADES` lists what changed since BASE, and the dependencies that
-          # moved to a lower version.
+          # version in OLD, or the lowest locked one above it, and lets
+          # `cargo metadata` rewrite the lock. It fails if
+          # `cargo metadata --locked` rejects the lock before any repair. It
+          # keeps every edge's repair if cargo keeps them together. Otherwise
+          # it adds one edge's repair at a time, and keeps each that cargo
+          # keeps together with those kept before it. `report BASE
+          # CHANGES DOWNGRADES` lists what changed since BASE, and the
+          # dependencies that moved to a lower version.
           cat > "$dir/lock.py" <<'PY'
           import re, subprocess, sys, tomllib
-          from functools import reduce
+          from collections import Counter
 
           def key(v):
               core, _, pre = v.split('+')[0].partition('-')
@@ -100,73 +103,141 @@ jobs:
           def pid(p):
               return p['name'], p['version'], p.get('source')
 
-          # Package id -> {dependency name: (entry, package id)}. An entry is
-          # "name", "name version" or "name version (source)", whichever is
-          # unique in its file. A name a package depends on twice is left out.
-          def edges(pkgs):
+          # Name -> the ids of the packages of that name.
+          def index(ids):
               by = {}
-              for p in pkgs:
-                  by.setdefault(p['name'], []).append(pid(p))
+              for i in ids:
+                  by.setdefault(i[0], []).append(i)
+              return by
+
+          # The id of the package an entry names, or None. An entry is "name",
+          # "name version" or "name version (source)", whichever is unique in its file.
+          def target(e, by):
+              name, ver, src = re.fullmatch(r'(\S+)(?: (\S+))?(?: \((.+)\))?', e).groups()
+              c = [i for i in by.get(name, []) if ver in (None, i[1]) and src in (None, i[2])]
+              return c[0] if len(c) == 1 else None
+
+          # Package id -> {dependency name: (entry, package id)}. A name a package
+          # depends on twice is left out.
+          def edges(pkgs):
+              by = index(map(pid, pkgs))
               out = {}
               for p in pkgs:
                   deps = {}
                   for e in p.get('dependencies', []):
-                      name, ver, src = re.fullmatch(r'(\S+)(?: (\S+))?(?: \((.+)\))?', e).groups()
-                      c = [i for i in by.get(name, []) if ver in (None, i[1]) and src in (None, i[2])]
-                      deps[name] = None if name in deps or len(c) != 1 else (e, c[0])
+                      name, i = e.split(' ')[0], target(e, by)
+                      deps[name] = None if name in deps or not i else (e, i)
                   out[pid(p)] = {n: d for n, d in deps.items() if d}
               return out
 
           def lower(old, new):
               return old[2] == new[2] and key(new[1]) < key(old[1])
 
+          # Package id -> how many of its entries name each package id. An entry
+          # that names no package counts as itself.
+          def targets(pkgs):
+              by = index(map(pid, pkgs))
+              return {pid(p): Counter(target(e, by) or e for e in p.get('dependencies', [])) for p in pkgs}
+
           def repair(old_path):
               old = edges(load(old_path)[1])
               text, pkgs = load('Cargo.lock')
-              ids = {pid(p) for p in pkgs}
-              fixes = {}
-              for parent, deps in edges(pkgs).items():
+              by = index(map(pid, pkgs))
+              before = edges(pkgs)
+              fixes = {}  # (parent, entry) -> (id the entry names, id it should name)
+              for parent, deps in before.items():
                   for name, (e, n) in deps.items():
                       o = old.get(parent, {}).get(name, (None, None))[1]
                       if o and lower(o, n):
-                          ups = [i[1] for i in ids if i[0] == name and i[2] == n[2] and key(i[1]) >= key(o[1])]
+                          # A pre-release is admitted only by a range that names one.
+                          ups = [i for i in by[name] if i[2] == n[2] and key(i[1]) >= key(o[1])
+                                 and (key(i[1])[1] or not key(o[1])[1])]
                           if ups:
-                              v = o[1] if o[1] in ups else max(ups, key=key)
-                              fixes.setdefault(parent, []).append((e, e.replace(f'{name} {n[1]}', f'{name} {v}', 1)))
-
-              def apply(text, parent):
-                  head = re.escape(f'\n[[package]]\nname = "{parent[0]}"\nversion = "{parent[1]}"\n'
-                                   + (f'source = "{parent[2]}"\n' if parent[2] else ''))
-                  m = re.search(head + r'(?!source = )(?:.+\n)*', text)
-                  if not m:
-                      return text
-                  block = m.group(0)
-                  for e, r in fixes[parent]:
-                      block = block.replace(f'\n "{e}",\n', f'\n "{r}",\n')
-                  return text[:m.start()] + block + text[m.end():]
-
-              def log(verb, parent):
-                  print(f'{verb} {parent[0]} {parent[1]}: ' + ', '.join(f'{e} -> {r}' for e, r in fixes[parent]),
-                        file=sys.stderr)
-
-              def accepted(text):
-                  open('Cargo.lock', 'w').write(text)
-                  return subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-
+                              # A range that admits OLD's version and any of these admits the lowest.
+                              fixes[parent, e] = (n, min(ups, key=lambda i: key(i[1])))
               if not fixes:
                   return
-              if accepted(reduce(apply, fixes, text)):
-                  for parent in fixes:
-                      log('repaired', parent)
+              counts = targets(pkgs)
+
+              # Cargo.lock with the edits' entries rewritten in full, so each still
+              # names its package after cargo drops the versions nothing uses.
+              def apply(edits):
+                  out = text
+                  for parent in {p for p, _ in edits}:
+                      head = re.escape(f'\n[[package]]\nname = "{parent[0]}"\nversion = "{parent[1]}"\n'
+                                       + (f'source = "{parent[2]}"\n' if parent[2] else ''))
+                      if not (m := re.search(head + r'(?!source = )(?:.+\n)*', out)):
+                          continue
+                      block = m.group(0)
+                      for p, e in edits:
+                          if p == parent:
+                              i = fixes[p, e][1]
+                              full = f'{i[0]} {i[1]}' + (f' ({i[2]})' if i[2] else '')
+                              block = block.replace(f'\n "{e}",\n', f'\n "{full}",\n')
+                      out = out[:m.start()] + block + out[m.end():]
+                  return out
+
+              def log(verb, edit):
+                  (parent, e), i = edit, fixes[edit][1]
+                  print(f'{verb} {parent[0]} {parent[1]}: {e} -> {i[0]} {i[1]}', file=sys.stderr)
+
+              def metadata(*flags):
+                  r = subprocess.run(['cargo', 'metadata', *flags, '--offline', '--format-version', '1'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                  if r.returncode:
+                      print(r.stderr.rstrip(), file=sys.stderr)
+                  return r.returncode == 0
+
+              # Cargo.lock as cargo rewrites it with the edits applied, or None. Cargo
+              # drops the packages nothing reaches and shortens the entries. It also
+              # moves an edge back that the parent's range does not admit, so the
+              # result is kept only if every package's entries name what is expected
+              # of them and no package is new.
+              def relock(edits):
+                  open('Cargo.lock', 'w').write(apply(edits))
+                  if not metadata():
+                      return None
+                  out = open('Cargo.lock').read()
+                  pkgs = tomllib.loads(out).get('package', [])
+                  new = {pid(p) for p in pkgs} - counts.keys()
+                  for i in sorted(new, key=repr):
+                      print(f'cargo adds {i[0]} {i[1]}', file=sys.stderr)
+                  ok = not new
+                  for parent, got in targets(pkgs).items():
+                      want = Counter(counts.get(parent))
+                      for edit, (n, i) in fixes.items():
+                          if edit[0] == parent and edit in edits:
+                              want[n] -= 1
+                              want[i] += 1
+                      if got != want:
+                          ok = False
+                          extra, missing = got - want, want - got
+                          for i in extra.elements():
+                              if not isinstance(i, tuple):
+                                  print(f'cargo writes {parent[0]} {parent[1]}\'s entry {i}', file=sys.stderr)
+                                  continue
+                              w = next((j for j in missing if isinstance(j, tuple) and j[0] == i[0]), None)
+                              print(f'cargo resolves {parent[0]} {parent[1]}\'s {i[0]} to {i[1]}'
+                                    + (f', not {w[1]}' if w else ''), file=sys.stderr)
+                  return out if ok else None
+
+              # A lock cargo rejects as written would make every repair look rejected.
+              if not metadata('--locked'):
+                  sys.exit('cargo metadata --locked --offline fails on the lock cargo update wrote')
+              if (out := relock(set(fixes))) is not None:
+                  for edit in fixes:
+                      log('repaired', edit)
                   return
-              for parent in fixes:
-                  if accepted(t := apply(text, parent)):
-                      text = t
-                      log('repaired', parent)
+              print('cargo does not keep the repairs together; trying one edge at a time', file=sys.stderr)
+              kept, out = set(), text
+              for edit in fixes:
+                  if (t := relock(kept | {edit})) is not None:
+                      kept.add(edit)
+                      out = t
+                      log('repaired', edit)
                   else:
-                      log('cannot repair', parent)
-              open('Cargo.lock', 'w').write(text)
+                      log('cannot repair', edit)
+              open('Cargo.lock', 'w').write(out)
 
           def write(path, lines, n=200):
               lines = sorted(lines)
@@ -179,10 +250,12 @@ jobs:
               was, ids = {pid(p) for p in base}, {pid(p) for p in final}
               gone, added = was - ids, ids - was
               lines = []  # (line, whether it is a downgrade)
+              replaced = set()  # the names with one version gone and one added
               for name in {i[0] for i in gone | added}:
                   r, a = [i for i in gone if i[0] == name], [i for i in added if i[0] == name]
                   if len(r) == len(a) == 1:
                       lines.append((f'- `{name}` {r[0][1]} → {a[0][1]}', lower(r[0], a[0])))
+                      replaced.add(name)
                   else:
                       lines += [(f'- `{name}` {i[1]} added', False) for i in a]
                       lines += [(f'- `{name}` {i[1]} removed', False) for i in r]
@@ -190,8 +263,10 @@ jobs:
               for parent in old.keys() & new.keys():
                   for name in old[parent].keys() & new[parent].keys():
                       o, n = old[parent][name][1], new[parent][name][1]
-                      # A dependency that was itself updated is listed above.
-                      if o != n and o in ids:
+                      # A dependency that was itself updated is listed above,
+                      # unless the edge moved down from a version now gone and
+                      # no single line above names the move.
+                      if o != n and (o in ids or lower(o, n) and name not in replaced):
                           lines.append((f'- `{parent[0]} {parent[1]}` depends on `{name}` {n[1]}, not {o[1]}', lower(o, n)))
               write(changes, [x for x, _ in lines])
               write(downgrades, [x for x, d in lines if d])
@@ -208,7 +283,11 @@ jobs:
             cargo update -p "$1"
             # An updated crate is not downloaded yet, and --offline cannot fetch it.
             cargo fetch
-            python3 "$dir/lock.py" repair "$dir/Cargo.lock"
+            if ! python3 "$dir/lock.py" repair "$dir/Cargo.lock"; then
+              echo "::warning::lock.py repair failed after cargo update -p $1, so $1 stays as it was"
+              cp "$dir/Cargo.lock" Cargo.lock
+              return 0
+            fi
             findings next --offline
             if [ "$(wc -l < "$dir/next")" -lt "$(wc -l < "$dir/after")" ]; then
               mv "$dir/next" "$dir/after"

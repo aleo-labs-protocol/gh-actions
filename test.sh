@@ -1473,8 +1473,10 @@ ba_step() { # step name, env assignments -> its exit code
 # `cargo deny --offline` fails until `cargo fetch` runs. With BA_FLIP, it also
 # moves errno's and hyper-util's edges to the lower versions old-user holds, as
 # cargo does to the dependencies of the crate it updates; with BA_RAISE, it
-# raises socket2 0.6.5 to 0.6.6 first. `cargo metadata
-# --locked` rejects the lockfile once BA_REJECT's edge to socket2 0.6.5 is back.
+# raises socket2 0.6.5 to 0.6.6 first. `cargo metadata` drops the source from
+# each entry, and moves BA_REJECT's edge to socket2 0.6.5 back to 0.5.10, as
+# cargo does to an edge outside its range. `cargo metadata --locked` rejects
+# any lockfile with BA_OFFLINE, as when a crate is missing offline.
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
 case "$*" in
@@ -1489,9 +1491,14 @@ case "$*" in
     printf '\n# %s\n' "$3" >> Cargo.lock
     touch "$BA_TMP/unfetched";;
   fetch) rm -f "$BA_TMP/unfetched";;
-  "metadata --locked --offline --format-version 1")
+  "metadata --locked --offline --format-version 1"|"metadata --offline --format-version 1")
     [ -e "$BA_TMP/unfetched" ] && { echo "error: --offline was specified" >&2; exit 1; }
-    ! sed -n "/^name = \"${BA_REJECT:-}\"\$/,/^\$/p" Cargo.lock | grep -q '"socket2 0.6.5"';;
+    [ -n "${BA_OFFLINE:-}" ] && { echo "error: no matching package named \`zip\` found" >&2; exit 1; }
+    [ "$2" = --locked ] && exit 0
+    sed -i 's/^ "\([^ "]* [^ "]*\) ([^)]*)",$/ "\1",/' Cargo.lock
+    if [ -n "${BA_REJECT:-}" ]; then
+      sed -i "/^name = \"$BA_REJECT\"\$/,/^\$/s/\"socket2 0.6.5\"/\"socket2 0.5.10\"/" Cargo.lock
+    fi;;
   "deny --format json check advisories"|"deny --offline --format json check advisories")
     [ "$2" = --offline ] && [ -e "$BA_TMP/unfetched" ] \
       && { echo "error: failed to download \`$3\`: --offline was specified" >&2; exit 1; }
@@ -1604,7 +1611,7 @@ ba_bump() { # env assignments -> the step's exit code
 }
 ba_ids() { cut -f1 "$ba_tmp/runner/bump-advisories/$1" | tr '\n' ' '; }
 ba_out() { tr '\n' '|' < "$ba_tmp/runner/bump-advisories/$1"; }
-ba_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "$ba_tmp/work/Cargo.lock" | tr '\n' '|'; }
+ba_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "${2:-$ba_tmp/work/Cargo.lock}" | tr '\n' '|'; }
 ba_all="RUSTSEC-2026-0367 RUSTSEC-2026-0368 RUSTSEC-2026-0369 "
 ck "clean: the step succeeds"        "$(ba_bump BA_CLEAN=1)" "0"
 ck "clean: nothing updated"          "$(cat "$ba_tmp/log")" ""
@@ -1637,11 +1644,16 @@ ck "raised: socket2 is a change"     "$(ba_out changes)" '- `socket2` 0.6.5 → 
 ck "raised: no downgrades"           "$(ba_out downgrades)" ""
 ck "rejected: the step succeeds"     "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_REJECT=hyper-util)" "0"
 ck "rejected: errno is repaired"     "$(ba_deps errno)" "windows-sys 0.61.2|"
-ck "rejected: hyper-util is not"     "$(ba_deps hyper-util)" "socket2 0.5.10|windows-sys 0.52.0|"
+ck "rejected: only its socket2 edge" "$(ba_deps hyper-util)" "socket2 0.5.10|windows-sys 0.61.2|"
 ck "rejected: the downgrades"        "$(ba_out downgrades)" \
-   '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|- `hyper-util 0.1.20` depends on `windows-sys` 0.52.0, not 0.61.2|'
-ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "2"
+   '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|'
+ck "rejected: are changes too"       "$(grep -c hyper-util "$ba_tmp/runner/bump-advisories/changes")" "1"
 ck "rejected: still fixed"           "$(ba_ids fixed)" "$ba_all"
+ck "rejected: cargo's move is shown" "$(grep -c "^cargo resolves hyper-util 0.1.20's socket2 to 0.5.10, not 0.6.5" "$ba_tmp/out")" "2"
+ck "cargo fails anyway: the step succeeds" "$(ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_OFFLINE=1)" "0"
+ck "cargo fails anyway: it says why" "$(for m in '^error: no matching package' '^cargo metadata --locked --offline fails' '^::warning::lock.py repair failed after cargo update -p zip@8.6.0,'; do grep -q "$m" "$ba_tmp/out" && printf y; done)" "yyy"
+ck "cargo fails anyway: zip stays"   "$(git -C "$ba_tmp/work" diff --quiet -- Cargo.lock; echo $?)" "0"
+ck "cargo fails anyway: all left"    "$(ba_ids after)" "$ba_all"
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
 ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
 
@@ -1719,8 +1731,8 @@ ck "a rewritten commit: comments too" "$(ba_publish BA_PR=5 BA_SHA=0123 BA_COMMI
 ck "the same lock: no comment either" "$(ba_publish BA_PR=5 BA_SHA="$(git -C "$ba_tmp/work" hash-object Cargo.lock)" BA_HUMAN=alice)$(ba_log)" "0"
 ba_bump BA_FIX=zip@8.6.0 BA_FLIP=1 BA_REJECT=hyper-util >/dev/null
 ck "rejected: the step succeeds"     "$(ba_publish)" "0"
-ck "rejected: the body warns"        "$(grep -c '^- `hyper-util 0.1.20` depends on' "$ba_tmp/body.pr-create")" "4"
-ck "rejected: in its own list"       "$(sed -n '/could not move them back/,/^Opened by/p' "$ba_tmp/body.pr-create" | grep -c '^- ')" "2"
+ck "rejected: the body warns"        "$(grep -c '^- `hyper-util 0.1.20` depends on' "$ba_tmp/body.pr-create")" "2"
+ck "rejected: in its own list"       "$(sed -n '/could not move them back/,/^Opened by/p' "$ba_tmp/body.pr-create" | grep -c '^- ')" "1"
 ck "rejected: then a blank line"    "$(grep -B1 "^Opened by" "$ba_tmp/body.pr-create" | head -1)" ""
 
 ba_bump BA_FIX=nothing >/dev/null
@@ -1747,6 +1759,138 @@ ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$ba_tmp"
+
+echo "== bump-advisories: lock.py on real lockfiles =="
+# The step's own lock.py, cut from its heredoc.
+lk_tmp="$(mktemp -d)"
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/workflows/bump-advisories.yml'))
+st = next(x for x in d['jobs']['bump']['steps'] if x.get('name') == 'Update the crates with advisories')
+open('$lk_tmp/run.sh', 'w').write(st['run'])
+"
+sed -n "/^cat > \"\$dir\/lock.py\" <<'PY'\$/,/^PY\$/p" "$lk_tmp/run.sh" | sed '1d;$d' > "$lk_tmp/lock.py"
+ck "lock.py is extracted"            "$(grep -c '^def \(repair\|report\)(' "$lk_tmp/lock.py")" "2"
+# A Cargo.lock as cargo writes it: one "name version [entry,entry...]" per
+# package, in cargo's order. The first is the workspace's own package.
+lk_lock() {
+  local spec n v d src=
+  printf '# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n'
+  for spec in "$@"; do
+    read -r n v d <<< "$spec"
+    printf '\n[[package]]\nname = "%s"\nversion = "%s"\n%s' "$n" "$v" "$src"
+    src='source = "registry+https://github.com/rust-lang/crates.io-index"'$'\n'
+    [ -z "$d" ] || { echo 'dependencies = ['; tr , '\n' <<< "$d" | sed 's/.*/ "&",/'; echo ']'; }
+  done
+}
+lk_report() { # lockfile, base lockfile -> changes|downgrades
+  rm -rf "$lk_tmp/r"; mkdir "$lk_tmp/r"; cp "$1" "$lk_tmp/r/Cargo.lock"
+  ( cd "$lk_tmp/r" && python3 "$lk_tmp/lock.py" report "$2" changes downgrades ) || echo "report failed"
+  printf '%s#%s' "$(tr '\n' '|' < "$lk_tmp/r/changes")" "$(tr '\n' '|' < "$lk_tmp/r/downgrades")"
+}
+lk_lock "app 0.1.0 hyper-util,old-user" "hyper-util 0.1.20 socket2 0.6.5" "old-user 1.0.0 socket2 0.5.10" \
+        "socket2 0.5.10" "socket2 0.6.5" > "$lk_tmp/base.lock"
+# cargo relocked hyper-util to socket2 0.5.10, and dropped 0.6.5.
+lk_lock "app 0.1.0 hyper-util,old-user" "hyper-util 0.1.20 socket2" "old-user 1.0.0 socket2" \
+        "socket2 0.5.10" > "$lk_tmp/gone.lock"
+ck "report: down from a version gone" "$(lk_report "$lk_tmp/gone.lock" "$lk_tmp/base.lock")" \
+   '- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|- `socket2` 0.6.5 removed|#- `hyper-util 0.1.20` depends on `socket2` 0.5.10, not 0.6.5|'
+# cargo raised socket2 0.6.5 to 0.6.6: a change, listed once.
+lk_lock "app 0.1.0 hyper-util,old-user" "hyper-util 0.1.20 socket2 0.6.6" "old-user 1.0.0 socket2 0.5.10" \
+        "socket2 0.5.10" "socket2 0.6.6" > "$lk_tmp/up.lock"
+ck "report: up to a new version"     "$(lk_report "$lk_tmp/up.lock" "$lk_tmp/base.lock")" \
+   '- `socket2` 0.6.5 → 0.6.6|#'
+# cargo replaced socket2 0.6.5 with 0.5.10: one downgrade line, not one per user.
+lk_lock "app 0.1.0 hyper-util" "hyper-util 0.1.20 socket2" "socket2 0.6.5" > "$lk_tmp/one.lock"
+lk_lock "app 0.1.0 hyper-util" "hyper-util 0.1.20 socket2" "socket2 0.5.10" > "$lk_tmp/one-down.lock"
+ck "report: one version replaced"    "$(lk_report "$lk_tmp/one-down.lock" "$lk_tmp/one.lock")" \
+   '- `socket2` 0.6.5 → 0.5.10|#- `socket2` 0.6.5 → 0.5.10|'
+
+# `repair` asks real cargo, offline, about a workspace whose crates.io is a
+# directory of empty crates. CARGO_HOME is empty, so no user config applies.
+lk_ws="$lk_tmp/ws"
+mkdir -p "$lk_ws/.cargo" "$lk_ws/app/src" "$lk_tmp/home"
+: > "$lk_ws/app/src/lib.rs"
+printf '[workspace]\nmembers = ["app"]\nresolver = "2"\n' > "$lk_ws/Cargo.toml"
+printf '[source.crates-io]\nreplace-with = "v"\n\n[source.v]\ndirectory = "vendor"\n' > "$lk_ws/.cargo/config.toml"
+lk_crate() { # name version [dependency line...]
+  local d="$lk_ws/vendor/$1-$2"
+  mkdir -p "$d/src"; : > "$d/src/lib.rs"
+  printf '{"files":{},"package":null}' > "$d/.cargo-checksum.json"
+  printf '[package]\nname = "%s"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' "$1" "$2" > "$d/Cargo.toml"
+  shift 2; printf '%s\n' "$@" >> "$d/Cargo.toml"
+}
+lk_crate libc 0.2.0
+lk_crate socket2 0.5.10 'libc = "0.2"'
+for v in 0.6.5 0.6.6 0.7.0 0.7.1-beta.1 0.8.0; do lk_crate socket2 "$v"; done
+lk_crate beta-user 1.0.0 'socket2 = "=0.7.1-beta.1"'
+lk_crate eight-user 1.0.0 'socket2 = "0.8"'
+lk_crate five-user 1.0.0 'socket2 = "0.5"'
+lk_crate wide-user 1.0.0 'socket2 = ">=0.5, <0.9"'
+lk_crate hyper-util 0.1.20 'socket2 = ">=0.5, <0.7"'
+lk_crate quinn 0.11.0 'socket2 = ">=0.5, <0.7"'
+lk_crate tokio 1.0.0 'socket2 = "0.6"'
+lk_crate mio 1.0.0 'socket2 = "0.7"'
+lk_crate old-user 1.0.0 'hyper-util = "0.1"' 'quinn = "0.11"' 'socket2 = "0.5"'
+lk_crate old-user 1.0.1 'hyper-util = "0.1"' 'quinn = "0.11"'
+lk_cargo() { ( cd "$lk_ws" && CARGO_HOME="$lk_tmp/home" CARGO_NET_OFFLINE=true cargo "$@" ); }
+lk_repair() { # base lockfile, the lockfile cargo update wrote, app's dependencies -> exit code
+  printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' > "$lk_ws/app/Cargo.toml"
+  printf '%s = "*"\n' "${@:3}" >> "$lk_ws/app/Cargo.toml"
+  cp "$2" "$lk_ws/Cargo.lock"
+  ( cd "$lk_ws" && CARGO_HOME="$lk_tmp/home" CARGO_NET_OFFLINE=true python3 "$lk_tmp/lock.py" repair "$1" ) > "$lk_tmp/out" 2>&1
+  echo "$?"
+}
+lk_deps() { ba_deps "$1" "$lk_ws/Cargo.lock"; }
+ck "cargo is on PATH"                "$(command -v cargo >/dev/null && echo yes)" "yes"
+
+# cargo raised tokio's socket2 0.6.5 to 0.6.6 and relocked hyper-util to
+# 0.5.10. 0.7.0 is locked too, for mio, but is outside hyper-util's range.
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "libc 0.2.0" "mio 1.0.0 socket2 0.7.0" \
+        "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.5" \
+        "socket2 0.5.10 libc" "socket2 0.6.5" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 mio,old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "libc 0.2.0" "mio 1.0.0 socket2 0.7.0" \
+        "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" "quinn 0.11.0 socket2 0.6.6" \
+        "socket2 0.5.10 libc" "socket2 0.6.6" "socket2 0.7.0" "tokio 1.0.0 socket2 0.6.6" > "$lk_tmp/head.lock"
+ck "raised: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" mio old-user tokio)" "0"
+ck "raised: to the lowest above"     "$(lk_deps hyper-util)" "socket2 0.6.6|"
+ck "raised: cargo agrees"            "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
+
+# cargo relocked wide-user to socket2 0.5.10 and dropped 0.6.5. The lowest
+# locked version above 0.6.5 is a pre-release that wide-user's range does not
+# admit; 0.8.0 is above it and admitted.
+lk_lock "app 0.1.0 beta-user,eight-user,five-user,wide-user" "beta-user 1.0.0 socket2 0.7.1-beta.1" \
+        "eight-user 1.0.0 socket2 0.8.0" "five-user 1.0.0 socket2 0.5.10" "libc 0.2.0" "socket2 0.5.10 libc" \
+        "socket2 0.6.5" "socket2 0.7.1-beta.1" "socket2 0.8.0" "wide-user 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 beta-user,eight-user,five-user,wide-user" "beta-user 1.0.0 socket2 0.7.1-beta.1" \
+        "eight-user 1.0.0 socket2 0.8.0" "five-user 1.0.0 socket2 0.5.10" "libc 0.2.0" "socket2 0.5.10 libc" \
+        "socket2 0.7.1-beta.1" "socket2 0.8.0" "wide-user 1.0.0 socket2 0.5.10" > "$lk_tmp/head.lock"
+ck "pre-release: repair succeeds"    "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" beta-user eight-user five-user wide-user)" "0"
+ck "pre-release: skipped"            "$(lk_deps wide-user)" "socket2 0.8.0|"
+ck "pre-release: cargo agrees"       "$(lk_cargo metadata --locked --format-version 1 >/dev/null 2>&1; echo $?)" "0"
+
+# old-user 1.0.1 no longer uses socket2 0.5.10, but cargo relocked hyper-util
+# and quinn to it. Moving both back leaves 0.5.10 unused, so cargo drops it and
+# the libc only it used, and names the one socket2 left by name alone.
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2 0.6.5" "libc 0.2.0" "old-user 1.0.0 hyper-util,quinn,socket2 0.5.10" \
+        "quinn 0.11.0 socket2 0.6.5" "socket2 0.5.10 libc" "socket2 0.6.5" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/base.lock"
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2 0.5.10" "libc 0.2.0" "old-user 1.0.1 hyper-util,quinn" \
+        "quinn 0.11.0 socket2 0.5.10" "socket2 0.5.10 libc" "socket2 0.6.5" "tokio 1.0.0 socket2 0.6.5" > "$lk_tmp/head.lock"
+lk_lock "app 0.1.0 old-user,tokio" "hyper-util 0.1.20 socket2" "old-user 1.0.1 hyper-util,quinn" \
+        "quinn 0.11.0 socket2" "socket2 0.6.5" "tokio 1.0.0 socket2" > "$lk_tmp/want.lock"
+ck "unused: repair succeeds"         "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" old-user tokio)" "0"
+ck "unused: both moved back"         "$(lk_deps hyper-util)$(lk_deps quinn)" "socket2|socket2|"
+ck "unused: as cargo writes it"      "$(diff "$lk_tmp/want.lock" "$lk_ws/Cargo.lock")" ""
+cp "$lk_ws/Cargo.lock" "$lk_tmp/repaired.lock"
+ck "unused: cargo leaves it as is"   "$(lk_cargo metadata --format-version 1 >/dev/null 2>&1; diff "$lk_tmp/repaired.lock" "$lk_ws/Cargo.lock")" ""
+# A crate cargo cannot find offline fails every check, repaired or not.
+mv "$lk_ws/vendor/socket2-0.5.10" "$lk_tmp/"
+ck "offline failure: repair fails"   "$(lk_repair "$lk_tmp/base.lock" "$lk_tmp/head.lock" old-user tokio)" "1"
+ck "offline failure: it says why"    "$(grep -c '^cargo metadata --locked --offline fails' "$lk_tmp/out")" "1"
+ck "offline failure: lock untouched" "$(diff "$lk_tmp/head.lock" "$lk_ws/Cargo.lock")" ""
+mv "$lk_tmp/socket2-0.5.10" "$lk_ws/vendor/"
+
+rm -rf "$lk_tmp"
 
 echo "== mirror-branches: fast-forward only =="
 # Real repositories over file://, so what the mirror ends up holding is git's
