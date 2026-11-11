@@ -190,8 +190,9 @@ jobs:
               for parent in old.keys() & new.keys():
                   for name in old[parent].keys() & new[parent].keys():
                       o, n = old[parent][name][1], new[parent][name][1]
-                      # A dependency that was itself updated is listed above.
-                      if o != n and o in ids:
+                      # A dependency that was itself updated is listed above,
+                      # unless the edge moved down from a version now gone.
+                      if o != n and (o in ids or lower(o, n)):
                           lines.append((f'- `{parent[0]} {parent[1]}` depends on `{name}` {n[1]}, not {o[1]}', lower(o, n)))
               write(changes, [x for x, _ in lines])
               write(downgrades, [x for x, d in lines if d])
