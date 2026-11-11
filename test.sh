@@ -148,14 +148,9 @@ ck "a stale offline registration is not busy" "$(census 3 3 1)" "0"
 # A 403 or a rate limit parsed as JSON comes back as "no runners" -- which is
 # also what an idle fleet looks like. Write nothing rather than write 0, so the
 # plan step can tell "nobody is busy" from "could not look".
-# BOXES, because the plan step adds this to a count of EC2 instances. A box
-# with RUNNER_SLOTS > 1 registers one runner per slot as NAME-1, NAME-2,
-# so counting registrations makes one busy box read as
-# three and takes `want` straight to the fleet cap.
-ck "a multi-slot box is one busy box" \
-   "$(census_named "cpu-runner-1 cpu-runner-2 cpu-runner-3")" "1"
-ck "and slots across two boxes are two" \
-   "$(census_named "cpu-runner-1 cpu-runner-2 cpu-runner2-1")" "2"
+# Each busy box is one runner, named for it.
+ck "two busy boxes are two" "$(census_named "cpu-runner cpu-runner2")" "2"
+ck "a name with a suffix is not the box" "$(census_named "cpu-runner-1")" "0"
 # A runner elsewhere in the org carrying the same label is not in this fleet,
 # and starting our boxes would not relieve whatever it is doing.
 ck "a busy runner outside the fleet is not counted" \
@@ -265,8 +260,8 @@ for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-re
   ck "$a is composite"  "$(grep -c 'using: composite' "$REPO/.github/actions/$a/action.yml")" "1"
 done
 # The two preflights protect different things now, deliberately: job-setup
-# protects the target dir it just named, which on a one-slot box is shared by
-# every job of the repository and lives outside the work root; gpu-test keeps
+# protects the target dir it just named, which where the box sets CI_TARGET_ROOT
+# is shared by every job of the repository and lives outside the work root; gpu-test keeps
 # its target beside the checkout, so gpu-runner-preflight protects the work
 # root and covers it. What must stay aligned is the guard path and the
 # missing-guard error, so those are pinned rather than the whole step.

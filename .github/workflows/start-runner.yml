@@ -253,23 +253,15 @@ jobs:
           # lingers up to 24h after a box is gone; `busy` is false for those.
           #
           # Counted in BOXES, which is the unit the plan step adds it to -- that
-          # side counts EC2 instances. Two corrections get it there:
-          #
-          #   * a box with RUNNER_SLOTS > 1 registers one runner per slot, named
-          #     NAME-1, NAME-2. Counting registrations would
-          #     make one fully-busy box read as three and take `want` straight
-          #     to the fleet cap -- every box started for a queue one box is
-          #     already draining. Slots are pinned to 1 today, so this is a
-          #     latent unit error rather than a live one, which is the kind
-          #     worth closing while the reason is still visible.
-          #   * a runner elsewhere in the org carrying the same label is not in
-          #     this fleet, and starting our boxes would not relieve it.
+          # side counts EC2 instances. Each box registers one runner under its
+          # Name tag. A runner elsewhere in the org carrying the same label is
+          # not in this fleet, and starting our boxes would not relieve it.
           busy=$(jq --arg l "$LABEL" --arg fleet "$FLEET" '
             ($fleet | split(" ")) as $f
             | [ .runners[]
                 | select(.labels[].name == $l)
                 | select(.busy and .status == "online")
-                | (.name | sub("-[0-9]+$"; ""))
+                | .name
                 | select(. as $n | $f | index($n)) ]
             | unique | length' <<<"$json")
           echo "${LABEL} boxes busy with someone's job: ${busy} (of ${FLEET})"
