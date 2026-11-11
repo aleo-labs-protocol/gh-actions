@@ -498,13 +498,6 @@ jobs:
             if [ "${CURRENT}" != "${PREFERRED}" ]; then
               echo "::notice::${RUNNER_ID} is ${CURRENT} but is configured for ${PREFERRED}; a past capacity shortfall left it there. Trying ${PREFERRED} first."
             fi
-            # g6f.xlarge, a fractional L4 (2861 MiB), is too small for the CUDA
-            # suite's 3 GiB device pool. A box an older ladder left
-            # there is moved off it, and never tried as itself below.
-            if [ "${CURRENT}" = "g6f.xlarge" ]; then
-              warn "this box is currently g6f.xlarge, a fractional L4 that cannot run the CUDA suite; retyping it to a full-size shape"
-              [ "${PREFERRED}" = "g6f.xlarge" ] && PREFERRED=g6.xlarge
-            fi
 
             # The chain starts at the shape the box is CONFIGURED for and only
             # ever steps DOWN this ladder. Both halves of that matter:
@@ -536,7 +529,7 @@ jobs:
             # PREFERRED is already in CHAIN above; anything on it ABOVE
             # PREFERRED is a shape this box must never be given, and appending
             # it unconditionally is how the chain came to step UP.
-            case " ${LADDER} g6f.xlarge " in
+            case " ${LADDER} " in
               *" ${CURRENT} "*) ;;
               *) case " ${CHAIN} " in
                    *" ${CURRENT} "*) ;;

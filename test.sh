@@ -379,8 +379,8 @@ ck "no \${{ }} in run bodies" "$(grep -c 'skip (contains' <<<"$lint_out")" "0"
 echo "== start-runner: capacity-fallback chain =="
 # Extracted from the real workflow YAML rather than hand-copied, so this cannot
 # drift from what actually ships. The chain has been rewritten three times in a
-# day -- immutable OIDC subjects, the capacity retry, a fallback whose target had
-# silently become its own source, and the g6f.xlarge tier -- and it is consumed
+# day -- immutable OIDC subjects, the capacity retry, and a fallback whose target
+# had silently become its own source -- and it is consumed
 # by two other repositories' CI with real AWS credentials. shellcheck cannot see
 # any of these bugs; only running the branches can.
 #
@@ -463,14 +463,6 @@ ck "a start past the quota is skipped" \
 ck "g6 and g6e exhausted -> named error" \
    "$(start_chain g6.xlarge CAP,CAP)" \
    "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.xlarge g6e.xlarge)|::error::no box carrying gpu is online and none could be started; jobs needing it queue for 24h before GitHub gives up|"
-# A box an older ladder left on g6f cannot run the suite: it
-# is retyped off it, and g6f is never tried, tagged or not.
-ck "box already g6f: retyped to g6.xlarge" \
-   "$(start_chain g6f.xlarge OK)" \
-   "::warning::this box is currently g6f.xlarge, a fractional L4 that cannot run the CUDA suite; retyping it to a full-size shape|started gpu-runner as g6.xlarge|"
-ck "box already g6f: never falls back to it" \
-   "$(PREFERRED_TAG=g6f.xlarge start_chain g6f.xlarge CAP,CAP | tr '|' '\n' | tail -n 2 | head -n 1)" \
-   "::warning::could not start i-gpu-runner as any of its shapes (tried: g6.xlarge g6e.xlarge)"
 # A permission error is not a capacity error. Returning "this tier is full" for
 # an UnauthorizedOperation walked the box down its entire ladder, retyping it at
 # every step and blaming capacity for each -- three misleading warnings and a
@@ -943,8 +935,8 @@ echo "== gpu-runner-preflight: which GPU it decides it landed on =="
 # step is consumed by two other repositories, and its whole job is to classify a
 # string nobody here can see until a job lands on unfamiliar hardware.
 #
-# It failed the one case it existed for. On a g6f the driver cannot bind the
-# vGPU, nvidia-smi exits 9, and the step reported "Process completed with exit
+# It failed the one case it existed for. When the driver is not loaded,
+# nvidia-smi exits 9, and the step reported "Process completed with exit
 # code 9" and nothing else -- because nvidia-smi prints its explanation to
 # STDOUT, straight into a command substitution that was never echoed. Finding
 # that took an EC2 console-log dump (#10). Mocking nvidia-smi is the only way to
@@ -986,16 +978,10 @@ ck "L40S still warns (the comma matters)" \
 ck "an A10G warns too" \
    "$(which_gpu 'NVIDIA A10G, 8.6, 23028 MiB')" \
    "::warning::ran on NVIDIA A10G, 8.6, 23028 MiB, not the L4 this code deploys to — a failure that depends on the deployment card's limits may not reproduce here|"
-# A g6f reports a PROFILE name. It matched neither arm before, so it fell to the
-# L40S branch and claimed the box might be more capable than the deployment
-# card -- the exact opposite of a slice with an eighth of the memory.
-ck "vGPU slice gets its own warning" \
-   "$(which_gpu 'NVIDIA L4-3Q, 8.9, 3072 MiB')" \
-   "::warning::ran on NVIDIA L4-3Q, 8.9, 3072 MiB — a vGPU SLICE of the L4, not a whole one. Same sm_89, but a fraction of the memory and time-sliced SMs shared with other tenants: a pass here is a correctness result, not a timing one|"
 # The regression this section exists for: a driver that did not load must say so.
 ck "driver failure names itself, not just exit 9" \
    "$(which_gpu "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver." 9)" \
-   "::error::nvidia-smi failed with exit 9; this box has no usable GPU.|::error::Exit 9 is NVML's \"driver not loaded\". On a full-size shape that is usually a kernel update the DKMS modules were not rebuilt for; on a g6f, which only the GRID driver binds, it is expected.|"
+   "::error::nvidia-smi failed with exit 9; this box has no usable GPU.|::error::Exit 9 is NVML's \"driver not loaded\", usually a kernel update the DKMS modules were not rebuilt for.|"
 # And it must still FAIL. Reporting the reason is worthless if the job goes
 # green on a box with no GPU.
 SMI_OUT="NVIDIA-SMI has failed" SMI_RC=9 EXPECTED_GPU=L4 \
