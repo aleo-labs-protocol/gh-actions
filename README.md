@@ -303,17 +303,16 @@ no admin bypass, a person who must move the branch edits the first ruleset.
 GitHub accepts the App as a bypass actor only once it is installed on the mirror.
 
 The mirror also receives the caller's workflows, and runs them: its own
-schedules, releases and bumps. `disable-mirror-workflows.sh` disables every
-one but those named, by default `ci.yml`:
+schedules, releases and bumps. Disable the ones that should not run there:
 
 ```sh
-./disable-mirror-workflows.sh my-org/app-private
+gh workflow disable ci.yml --repo my-org/app-private
 ```
 
 A disabled workflow stays disabled when its file changes, but a new file arrives
 enabled. The run warns when a fast-forward brings one, and names it in its
-summary; run the script again then. GitHub lists a workflow only once something
-has triggered it, so the script reports the files it cannot disable yet.
+summary. GitHub lists a workflow only once something has triggered it, so one
+that has not run yet cannot be disabled.
 
 Dependabot runs in the mirror too, from the mirrored `dependabot.yml`, and its
 entry cannot be disabled. A ruleset in the mirror that blocks creating
