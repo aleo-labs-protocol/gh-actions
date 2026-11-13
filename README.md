@@ -3,8 +3,9 @@
 The reusable workflows and composite actions that aleo-labs-protocol
 repositories share: starting and running on the self-hosted runner fleet, and
 merging branches forward (`merge-branches.yml`), mirroring branches into
-another repository (`mirror-branches.yml`), and bumping crates that have
-security advisories (`bump-advisories.yml`). The fleet itself — the boxes,
+another repository (`mirror-branches.yml`), bumping crates that have
+security advisories (`bump-advisories.yml`), and bumping a pin to another
+repository's branch (`bump-pr`). The fleet itself — the boxes,
 their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
 
@@ -372,6 +373,53 @@ jobs:
 
 The crates are updated before the App token is created, so nothing `cargo`
 runs can read it.
+
+## Bumping a pin
+
+The `bump-pr` action opens one pull request that moves a pin, such as a
+submodule or a git dependency's `rev`, to the tip of another repository's
+branch. The caller finds the two commits, edits the pin and relocks. Then it
+creates the App token and runs `bump-pr` as its last step.
+
+- It commits `paths` to `pr-branch`, rebuilt from the base, and force-pushes
+  it. A run whose tree matches the branch's tip leaves it alone.
+- The body lists the source branch's first-parent commits. A merged pull
+  request is listed by its title, or as `owner/repo#N` when its merge commit
+  has no body. An `@` mentions no one. The body warns when the current pin has
+  commits that are not on the branch.
+- Once the branch's tip is a commit that someone other than the App wrote or
+  committed, the action comments once for each new tip of the source branch
+  instead. Close the pull request to hand the branch back.
+
+Check out the base with `persist-credentials: false`. Otherwise checkout's
+`github.token` overrides the App token, and the push starts no CI. The action
+fails when it finds that token.
+
+```yaml
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/bump-pr@v2
+        with:
+          token: ${{ steps.app.outputs.token }}
+          app-slug: ${{ steps.app.outputs.app-slug }}
+          source-repo: owner/dependency
+          source-dir: ${{ runner.temp }}/dependency  # a clone with both commits
+          source-branch: staging
+          current: ${{ steps.revs.outputs.current }}
+          latest: ${{ steps.revs.outputs.latest }}
+          base-branch: staging
+          pr-branch: ci/bump-dependency
+          title: Bump dependency to staging
+          paths: |
+            Cargo.toml
+            Cargo.lock
+```
 
 ## Versioning
 

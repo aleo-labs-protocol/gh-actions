@@ -1,0 +1,163 @@
+# Opens or updates the one pull request that moves a pin to the tip of another
+# repository's branch. The caller checks out its base branch with
+# persist-credentials: false, edits the pin, relocks, creates the App token and
+# then runs this as its last step. Nothing here runs the caller's build, so the
+# App token never reaches a build script.
+name: Bump pull request
+description: Commit a pin bump to one branch and open or update its pull request, listing the source's first-parent commits.
+
+inputs:
+  token:
+    description: A GitHub App token with contents, pull-requests and workflows write. A push with github.token starts no CI.
+    required: true
+  app-slug:
+    description: The App's slug, which the commit and the someone-else-pushed check use.
+    required: true
+  source-repo:
+    description: The pinned repository, as owner/name.
+    required: true
+  source-dir:
+    description: A clone of source-repo that has both current and latest. A treeless clone is enough.
+    required: true
+  source-branch:
+    description: The branch whose tip latest is.
+    required: true
+  current:
+    description: The commit the base branch pins.
+    required: true
+  latest:
+    description: The commit to pin.
+    required: true
+  base-branch:
+    description: The branch the pull request merges into, which the caller has checked out.
+    required: true
+  pr-branch:
+    description: The branch the workflow rebuilds and force-pushes.
+    required: true
+  title:
+    description: The commit and pull request title.
+    required: true
+  paths:
+    description: The files to commit, one per line. A submodule's path commits its checked-out commit.
+    required: true
+  preamble:
+    description: Markdown to put first in the pull request body.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Open or update the pull request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        APP_SLUG: ${{ inputs.app-slug }}
+        SOURCE_REPO: ${{ inputs.source-repo }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        SOURCE_BRANCH: ${{ inputs.source-branch }}
+        CURRENT: ${{ inputs.current }}
+        LATEST: ${{ inputs.latest }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        PR_BRANCH: ${{ inputs.pr-branch }}
+        TITLE: ${{ inputs.title }}
+        PATHS: ${{ inputs.paths }}
+        PREAMBLE: ${{ inputs.preamble }}
+      run: |
+        set -euo pipefail
+        bot="${APP_SLUG}[bot]"
+        repo=$GITHUB_REPOSITORY
+        # checkout's header would override the App token, and the push would
+        # start no CI.
+        if git config --get-regexp '^http\..*\.extraheader$' > /dev/null; then
+          echo "::error::The checkout keeps github.token. Check out with persist-credentials: false." >&2
+          exit 1
+        fi
+
+        git -c core.hooksPath=/dev/null checkout --quiet -B "$PR_BRANCH"
+        mapfile -t files < <(sed '/^[[:space:]]*$/d' <<< "$PATHS")
+        git add -- "${files[@]}"
+        if git diff --cached --quiet; then
+          echo "::notice::None of the paths changed."
+          exit 0
+        fi
+        tree=$(git write-tree)
+
+        # --head matches a fork's branch of the same name too.
+        pr=$(gh pr list --head "$PR_BRANCH" --base "$BASE_BRANCH" --state open --json number,isCrossRepository \
+               --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
+        if [ -n "$pr" ]; then
+          # The branch is rebuilt from the base, so the same tree means the same
+          # pin on the same base, and a push would only restart CI.
+          if [ "$(gh api "repos/$repo/commits/$PR_BRANCH" --jq .commit.tree.sha)" = "$tree" ]; then
+            echo "#$pr already holds this tree"
+            exit 0
+          fi
+          # The workflow pushes one commit of its own. A tip that someone else
+          # wrote or committed hands the branch to them: a force-push here
+          # would delete their work.
+          theirs=$(BOT=$bot gh api "repos/$repo/commits/$PR_BRANCH" \
+                     --jq 'select(.author.login != env.BOT or .committer.login != env.BOT) | .sha')
+          if [ -n "$theirs" ]; then
+            marker="<!-- $PR_BRANCH: $LATEST -->"
+            # Not piped: grep -q exits at the first match, and under pipefail
+            # gh's SIGPIPE would read as no match.
+            comments=$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq '.[].body')
+            if ! grep -qxF -- "$marker" <<< "$comments"; then
+              gh pr comment "$pr" --body "\`$SOURCE_BRANCH\` is now at $SOURCE_REPO@${LATEST:0:9}. Someone else has pushed to this branch, so the workflow does not rebuild it. Close this pull request, and the next run rebuilds the branch and opens a new one.
+
+        $marker"
+            fi
+            exit 0
+          fi
+        fi
+
+        body="$RUNNER_TEMP/bump-pr-body.md"
+        # Backticks in single quotes are Markdown.
+        # shellcheck disable=SC2016
+        {
+          if [ -n "$PREAMBLE" ]; then
+            printf '%s\n\n' "$PREAMBLE"
+          fi
+          printf 'Bumps `%s` from `%s` to `%s`, the tip of `%s`.\n\n' "$SOURCE_REPO" "${CURRENT:0:9}" "${LATEST:0:9}" "$SOURCE_BRANCH"
+          dropped=$(git -C "$SOURCE_DIR" rev-list --count "$LATEST..$CURRENT")
+          if [ "$dropped" != 0 ]; then
+            printf '> [!WARNING]\n> The current pin `%s` has %s commit(s) that are not on `%s`. Merging this drops them.\n\n' \
+              "${CURRENT:0:9}" "$dropped" "$SOURCE_BRANCH"
+          fi
+          printf 'Changes: %s/%s/compare/%s...%s\n\n' "$GITHUB_SERVER_URL" "$SOURCE_REPO" "$CURRENT" "$LATEST"
+          printf '## First-parent commits on `%s`\n\n' "$SOURCE_BRANCH"
+          # A zero-width space after each @, so a subject mentions no one.
+          zw='@&#8203;'
+          git -C "$SOURCE_DIR" rev-list --first-parent "$CURRENT..$LATEST" | while read -r sha; do
+            subject=$(git -C "$SOURCE_DIR" log -1 --format=%s "$sha")
+            if [[ $subject =~ ^Merge\ pull\ request\ \#([0-9]+)\  ]]; then
+              pr_title=$(git -C "$SOURCE_DIR" log -1 --format=%b "$sha" | sed -n '/./{p;q}')
+              if [ -n "$pr_title" ]; then
+                printf -- '- %s#%s: %s\n' "$SOURCE_REPO" "${BASH_REMATCH[1]}" "${pr_title//@/"$zw"}"
+              else
+                printf -- '- %s#%s\n' "$SOURCE_REPO" "${BASH_REMATCH[1]}"
+              fi
+            else
+              printf -- '- `%s` %s\n' "${sha:0:9}" "${subject//@/"$zw"}"
+            fi
+          done
+          printf '\nEach run that finds a newer `%s` commit, or a newer `%s`, rebuilds this branch from `%s` and force-pushes it. Once someone else pushes to the branch, for example to fix a breaking change, the workflow comments instead.\n' \
+            "$SOURCE_BRANCH" "$BASE_BRANCH" "$BASE_BRANCH"
+        } > "$body"
+        cat "$body"
+
+        # ci.yml runs this line on a real runner.
+        # shellcheck disable=SC2016
+        helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
+        git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
+        git config user.name "$bot"
+        git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
+        git -c core.hooksPath=/dev/null commit --quiet -m "$TITLE"
+        git -c core.hooksPath=/dev/null push --quiet --force origin "HEAD:refs/heads/$PR_BRANCH"
+
+        if [ -n "$pr" ]; then
+          gh pr edit "$pr" --title "$TITLE" --body-file "$body"
+        else
+          gh pr create --head "$PR_BRANCH" --base "$BASE_BRANCH" --title "$TITLE" --body-file "$body"
+        fi
