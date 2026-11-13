@@ -143,8 +143,8 @@ runs:
               printf -- '- `%s` %s\n' "${sha:0:9}" "${subject//@/"$zw"}"
             fi
           done
-          printf '\nEach run that finds a newer `%s` commit, or a newer `%s`, rebuilds this branch from `%s` and force-pushes it. Once someone else pushes to the branch, for example to fix a breaking change, the workflow comments instead.\n' \
-            "$SOURCE_BRANCH" "$BASE_BRANCH" "$BASE_BRANCH"
+          printf '\nWhen `%s` in %s or `%s` in this repository moves, the next run rebuilds this branch from `%s` and force-pushes it. Once someone else pushes to the branch, for example to fix a breaking change, the workflow comments instead.\n' \
+            "$SOURCE_BRANCH" "$SOURCE_REPO" "$BASE_BRANCH" "$BASE_BRANCH"
         } > "$body"
         cat "$body"
 
