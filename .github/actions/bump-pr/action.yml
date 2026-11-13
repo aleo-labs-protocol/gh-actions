@@ -116,8 +116,9 @@ runs:
         # Backticks in single quotes are Markdown.
         # shellcheck disable=SC2016
         {
-          if [ -n "$PREAMBLE" ]; then
-            printf '%s\n\n' "$PREAMBLE"
+          lead=$(sed '/./,$!d' <<< "$PREAMBLE")
+          if [ -n "$lead" ]; then
+            printf '%s\n\n' "$lead"
           fi
           printf 'Bumps `%s` from `%s` to `%s`, the tip of `%s`.\n\n' "$SOURCE_REPO" "${CURRENT:0:9}" "${LATEST:0:9}" "$SOURCE_BRANCH"
           dropped=$(git -C "$SOURCE_DIR" rev-list --count "$LATEST..$CURRENT")

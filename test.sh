@@ -2068,9 +2068,9 @@ cp "$bp_tmp/body.pr-comment" "$bp_tmp/comment"
 ck "the same latest: no comment"     "$(bp_run "$bp_latest" BP_PR=5 BP_HUMAN=alice BP_COMMENTS="$bp_tmp/comment")$(bp_log)" "0"
 ck "a rewritten commit: comments"    "$(bp_run "$bp_latest" BP_PR=5 BP_COMMITTER=alice)$(bp_log)" "0gh pr comment|"
 git -C "$bp_tmp/o.git" update-ref -d refs/heads/ci/bump
-ck "diverged: opens"                 "$(bp_run "$bp_latest" CURRENT="$bp_off" PREAMBLE='> note')$(bp_log)" "0gh pr create|"
+ck "diverged: opens"                 "$(bp_run "$bp_latest" CURRENT="$bp_off" PREAMBLE=$'\n> note\n')$(bp_log)" "0gh pr create|"
 ck "diverged: warns"                 "$(bp_line "> The current pin \`${bp_off:0:9}\` has 1 commit(s) that are not on \`main\`. Merging this drops them.")" "1"
-ck "the preamble comes first"        "$(head -1 "$bp_tmp/body.pr-create")" "> note"
+ck "the preamble comes first"        "$(head -3 "$bp_tmp/body.pr-create" | cut -c1-6 | tr '\n' '|')" "> note||Bumps |"
 ck "an unchanged pin: nothing"       "$(bp_run "$bp_pin")$(bp_log)" "0"
 ck "checkout's token: refused"       "$(bp_run "$bp_latest" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0=x)$(bp_log)" "1"
 
