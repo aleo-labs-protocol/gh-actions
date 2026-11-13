@@ -255,7 +255,7 @@ on = d.get('on', d.get(True))
 i = on['workflow_call']['inputs']
 print('yes' if i.get('role-to-assume', {}).get('required') else 'no')
 " 2>/dev/null)" "yes"
-for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-refs; do
+for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-refs bump-pr; do
   ck "$a action exists" "$([[ -f "$REPO/.github/actions/$a/action.yml" ]] && echo yes || echo no)" "yes"
   ck "$a is composite"  "$(grep -c 'using: composite' "$REPO/.github/actions/$a/action.yml")" "1"
 done
@@ -1735,7 +1735,7 @@ ck "clean: the comment says why"     "$(grep -c 'no longer needs this update' "$
 cp "$ba_tmp/body.pr-comment" "$ba_tmp/comment"
 ck "clean, commented: nothing"       "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_COMMENTS="$ba_tmp/comment")$(ba_log)" "0"
 # ci.yml's credential-helper job checks merge-branches.yml's copy.
-ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories,mirror-branches}.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
+ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories,mirror-branches}.yml "$REPO"/.github/actions/bump-pr/action.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$ba_tmp"
@@ -1971,6 +1971,111 @@ ck "the token never in the config"   "$(grep -c tok-SECRET "$mr_tmp/runner/mirro
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$mr_tmp"
+
+echo "== bump-pr: the pull request =="
+bp_tmp="$(mktemp -d)"
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$bp_tmp/gitconfig"
+git config -f "$GIT_CONFIG_GLOBAL" user.name test
+git config -f "$GIT_CONFIG_GLOBAL" user.email test@example.com
+git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch main
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/actions/bump-pr/action.yml'))
+open('$bp_tmp/step.sh', 'w').write(d['runs']['steps'][0]['run'])
+"
+# The source: a pin, then two merged pull requests, one whose merge commit has
+# no body, and a direct commit. An extra commit off the branch is a diverged pin.
+bp_src="$bp_tmp/src"
+git init -q "$bp_src"
+bp_s() { git -C "$bp_src" "$@"; }
+bp_s commit -q --allow-empty -m base; bp_pin=$(bp_s rev-parse HEAD)
+bp_s checkout -q -b x; bp_s commit -q --allow-empty -m "x work"; bp_s checkout -q main
+bp_s merge -q --no-ff -m "Merge pull request #7 from o/x" -m "Add @alice's thing" x
+bp_s checkout -q -b y; bp_s commit -q --allow-empty -m "y work"; bp_s checkout -q main
+bp_s merge -q --no-ff -m "Merge pull request #8 from o/y" y
+bp_s commit -q --allow-empty -m "Fix by @bob"; bp_latest=$(bp_s rev-parse HEAD)
+bp_s checkout -q --detach "$bp_pin"; bp_s commit -q --allow-empty -m off; bp_off=$(bp_s rev-parse HEAD); bp_s checkout -q main
+# The caller's repository: main pins bp_pin in the file `pin`.
+git init -q --bare "$bp_tmp/o.git"
+git clone -q "$bp_tmp/o.git" "$bp_tmp/seed" 2>/dev/null
+echo "$bp_pin" > "$bp_tmp/seed/pin"; git -C "$bp_tmp/seed" add pin
+git -C "$bp_tmp/seed" commit -q -m seed; git -C "$bp_tmp/seed" push -q origin main
+bp_move_base() { date +%N >> "$bp_tmp/seed/f"; git -C "$bp_tmp/seed" add f; git -C "$bp_tmp/seed" commit -q -m moved; git -C "$bp_tmp/seed" push -q origin main; }
+# BP_PR is the open pull request; a fork's #99 is always listed. The branch's
+# tip is the bot's, or one BP_HUMAN wrote or BP_COMMITTER rewrote, when set;
+# BP_COMMENTS holds the pull request's one comment.
+mkdir -p "$bp_tmp/bin"
+cat > "$bp_tmp/bin/gh" <<'GHEOF'
+#!/bin/bash
+[ "${GH_TOKEN:-}" = tok-SECRET ] || { echo "gh without the app token: gh $*" >&2; exit 1; }
+jq_arg() { local prev=; for a in "$@"; do [ "$prev" = --jq ] && { echo "$a"; return; }; prev=$a; done; }
+case "$*" in
+  "pr list --head ci/bump --base main "*)
+    jq -n --arg n "${BP_PR:-}" '[{number: 99, isCrossRepository: true}] + [$n | select(. != "") | {number: tonumber, isCrossRepository: false}]' \
+      | jq -r "$(jq_arg "$@")";;
+  "api repos/o/r/commits/ci/bump "*)
+    jq -n --arg t "$(git -C "$BP_TMP/o.git" rev-parse ci/bump^{tree})" --arg h "${BP_HUMAN:-}" --arg c "${BP_COMMITTER:-}" '{commit: {tree: {sha: $t}},
+      author: {login: (if $h != "" then $h else "merge-bot[bot]" end)},
+      committer: {login: (if $h != "" then "web-flow" elif $c != "" then $c else "merge-bot[bot]" end)}}' \
+      | jq -r "$(jq_arg "$@")";;
+  "api repos/o/r/issues/5/comments --paginate "*)
+    jq -n --rawfile b "${BP_COMMENTS:-/dev/null}" '[{body: "looks good"}] + [$b | select(. != "") | {body: .}]' \
+      | jq -r "$(jq_arg "$@")"
+    seq 100000;;
+  "api users/"*) echo 12345;;
+  "pr create"*|"pr edit"*|"pr comment"*)
+    echo "gh $1 $2" >> "$BP_TMP/log"
+    prev=; for a in "$@"; do
+      [ "$prev" = --body ] && printf '%s\n' "$a" > "$BP_TMP/body.$1-$2"
+      [ "$prev" = --body-file ] && cp "$a" "$BP_TMP/body.$1-$2"
+      prev=$a; done;;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+chmod +x "$bp_tmp/bin/gh"
+# A fresh checkout of main that pins $1, then the step, as on a runner.
+bp_run() { # pin, env assignments -> the step's exit code
+  local pin=$1; shift
+  rm -rf "$bp_tmp/work" "$bp_tmp/runner" "$bp_tmp"/body.*; : > "$bp_tmp/log"; mkdir "$bp_tmp/runner"
+  git clone -q "$bp_tmp/o.git" "$bp_tmp/work" 2>/dev/null
+  echo "$pin" > "$bp_tmp/work/pin"
+  ( cd "$bp_tmp/work" || exit 99
+    env PATH="$bp_tmp/bin:$PATH" BP_TMP="$bp_tmp" GH_TOKEN=tok-SECRET APP_SLUG=merge-bot GITHUB_REPOSITORY=o/r \
+      GITHUB_SERVER_URL=https://github.com RUNNER_TEMP="$bp_tmp/runner" SOURCE_REPO=o/s SOURCE_DIR="$bp_src" \
+      SOURCE_BRANCH=main CURRENT="$bp_pin" LATEST="$pin" BASE_BRANCH=main PR_BRANCH=ci/bump TITLE="Bump s" \
+      PATHS=$'pin\n' PREAMBLE= "$@" bash "$bp_tmp/step.sh" ) > "$bp_tmp/out" 2>&1
+  echo "$?"
+}
+bp_log() { tr '\n' '|' < "$bp_tmp/log"; }
+bp_line() { grep -cxF -- "$1" "$bp_tmp/body.pr-create"; }
+ck "new: opens, past a fork's"       "$(bp_run "$bp_latest")$(bp_log)" "0gh pr create|"
+ck "new: the branch pins latest"     "$(git -C "$bp_tmp/o.git" show ci/bump:pin)" "$bp_latest"
+ck "new: on main's tip"              "$(git -C "$bp_tmp/o.git" rev-parse ci/bump^)" "$(git -C "$bp_tmp/o.git" rev-parse main)"
+ck "new: as the bot"                 "$(git -C "$bp_tmp/o.git" log -1 --format='%an %ae' ci/bump)" "merge-bot[bot] 12345+merge-bot[bot]@users.noreply.github.com"
+ck "a merge with a title"            "$(bp_line "- o/s#7: Add @&#8203;alice's thing")" "1"
+ck "a merge without one"             "$(bp_line "- o/s#8")" "1"
+ck "a direct commit"                 "$(bp_line "- \`${bp_latest:0:9}\` Fix by @&#8203;bob")" "1"
+ck "only first-parent commits"       "$(grep -c '^- ' "$bp_tmp/body.pr-create")" "3"
+ck "no warning on an upgrade"        "$(grep -c WARNING "$bp_tmp/body.pr-create")" "0"
+ck "the same tree: nothing"          "$(bp_run "$bp_latest" BP_PR=5)$(bp_log)" "0"
+bp_move_base
+ck "a moved base: rebuilds"          "$(bp_run "$bp_latest" BP_PR=5)$(bp_log)" "0gh pr edit|"
+ck "a moved base: on main's tip"     "$(git -C "$bp_tmp/o.git" rev-parse ci/bump^)" "$(git -C "$bp_tmp/o.git" rev-parse main)"
+bp_move_base
+ck "a human's commit: comments"      "$(bp_run "$bp_latest" BP_PR=5 BP_HUMAN=alice)$(bp_log)" "0gh pr comment|"
+ck "and leaves the branch alone"     "$(git -C "$bp_tmp/o.git" rev-parse ci/bump^)" "$(git -C "$bp_tmp/o.git" rev-parse main^)"
+cp "$bp_tmp/body.pr-comment" "$bp_tmp/comment"
+ck "the same latest: no comment"     "$(bp_run "$bp_latest" BP_PR=5 BP_HUMAN=alice BP_COMMENTS="$bp_tmp/comment")$(bp_log)" "0"
+ck "a rewritten commit: comments"    "$(bp_run "$bp_latest" BP_PR=5 BP_COMMITTER=alice)$(bp_log)" "0gh pr comment|"
+git -C "$bp_tmp/o.git" update-ref -d refs/heads/ci/bump
+ck "diverged: opens"                 "$(bp_run "$bp_latest" CURRENT="$bp_off" PREAMBLE=$'\n> note\n')$(bp_log)" "0gh pr create|"
+ck "diverged: warns"                 "$(bp_line "> The current pin \`${bp_off:0:9}\` has 1 commit(s) that are not on \`main\`. Merging this drops them.")" "1"
+ck "the preamble comes first"        "$(head -3 "$bp_tmp/body.pr-create" | cut -c1-6 | tr '\n' '|')" "> note||Bumps |"
+ck "an unchanged pin: nothing"       "$(bp_run "$bp_pin")$(bp_log)" "0"
+ck "checkout's token: refused"       "$(bp_run "$bp_latest" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0=x)$(bp_log)" "1"
+
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+rm -rf "$bp_tmp"
 
 rm -rf "$no_aws"
 echo
