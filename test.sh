@@ -355,6 +355,12 @@ ck "the fleet is not hardcoded in the query" \
 # one trigger where the token is writable and the secrets are present.
 ck "guard rejects pull_request_target" \
    "$(grep -c "event_name != 'pull_request_target'" "$WF")" "2"
+# A `workflow_run` companion starts boxes for a fork's pull_request run, and
+# only once that run is in_progress. GitHub fires `requested` when an outside
+# contributor's run is created, before a maintainer approves it, and
+# `in_progress` only after approval.
+ck "guard admits workflow_run only for a fork run in progress" \
+   "$(grep -c "github.event.action == 'in_progress'" "$WF")" "1"
 
 # Values reach these scripts through `env:`, never interpolated into the body.
 # That is what keeps them lintable -- a `${{ }}` inside a run block is not valid
@@ -818,7 +824,10 @@ cat > "$sc_tmp/bin/gh" <<'GHEOF'
 # The URL is whichever argument starts with a slash: --paginate shifts it.
 url=""; for a in "$@"; do [[ "$a" == /* ]] && { url="$a"; break; }; done
 case "$url" in
-  */actions/workflows/*/runs*) [[ -n "${HIST_FAIL:-}" ]] && exit 1; for r in ${PREV_RUNS:-}; do echo "$r"; done ;;
+  */actions/workflows/*/runs*) [[ -n "${HIST_FAIL:-}" ]] && exit 1
+                               # HIST_WF names the one workflow whose history exists.
+                               [[ -z "${HIST_WF:-}" || "$url" == */workflows/"${HIST_WF}"/runs* ]] || exit 0
+                               for r in ${PREV_RUNS:-}; do echo "$r"; done ;;
   *"runs?status=queued"*)      [[ -n "${RUNS_FAIL:-}" ]] && exit 1
                                for r in $QUEUED_RUNS;  do p="PATH_$r"; echo "$r ${!p:-.github/workflows/other.yml}"; done ;;
   *"runs?status=in_progress"*) [[ -n "${RUNS_FAIL:-}" ]] && exit 1
@@ -836,7 +845,7 @@ chmod +x "$sc_tmp/bin/gh"
 queue() { # -> the two count lines, then what it handed the plan step
   : > "$sc_tmp/out"
   PATH="$sc_tmp/bin:$PATH" GITHUB_REPOSITORY=o/r GITHUB_OUTPUT="$sc_tmp/out" LABEL=cuda \
-  GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="${WF_REF:-o/r/.github/workflows/ci.yml@refs/heads/main}" \
+  GITHUB_RUN_ID="${RUN_ID:-3}" GITHUB_WORKFLOW_REF="${WF_REF:-o/r/.github/workflows/ci.yml@refs/heads/main}" \
   PREV_RUNS="${PREV_RUNS-9 8}" \
   JOBS_9="completed:self-hosted,linux,x64,cuda,sm_89 failure:self-hosted,cuda skipped:ubuntu-latest" \
   JOBS_8="completed:ubuntu-latest" \
@@ -882,6 +891,20 @@ ck "a concurrent run of this workflow counts as another run's worth" \
 ck "a ref containing @ still credits a sibling run" \
    "$(EXTRA_RUN=4 WF_REF="o/r/.github/workflows/ci.yml@refs/tags/v1@rc" queue)" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 4|queued=6"
+# Called from a `workflow_run` companion, GITHUB_WORKFLOW_REF names the
+# companion, whose runs hold no label jobs. The demand is the triggering run's:
+# its workflow's history sizes it, and the run itself is left out of the other
+# runs, or its queued jobs would count on top of that history.
+wfrun() { GITHUB_EVENT_NAME=workflow_run RUN_ID=50 \
+          WF_REF="o/r/.github/workflows/fork-pr-runners.yml@refs/heads/main" \
+          DEMAND_RUN_ID=3 DEMAND_PATH="$1" HIST_WF="${2:-ci.yml}" queue; }
+ck "workflow_run sizes from the triggering workflow" "$(wfrun .github/workflows/ci.yml)" \
+   "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
+# The fork controls its workflow file names. A path that is not a plain file
+# under .github/workflows/ is not used to build an API URL.
+ck "a workflow_run path with odd characters is not used" \
+   "$(wfrun '.github/workflows/c?i.yml' 'c?i.yml')" \
+   "cuda jobs this workflow releases per run: 0|queued cuda jobs in other o/r runs: 2|queued=2"
 ck "a concurrent run of a different workflow does not" \
    "$(EXTRA_RUN=4 PATH_4=.github/workflows/other.yml queue)" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"

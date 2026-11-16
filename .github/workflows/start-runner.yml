@@ -35,6 +35,34 @@
 #       runs-on: [self-hosted, linux, x64, gpu]
 #       ...
 #
+# A fork's `pull_request` run gets no secrets and no OIDC token, so the guard
+# skips its start job. For the fork's fleet jobs to run anyway -- they must
+# accept a skipped start job -- the caller adds a companion workflow. GitHub
+# runs it from the default branch, with the caller's secrets, when the fork's
+# run starts, which for an outside contributor is when a maintainer approves it:
+#
+#   on:
+#     workflow_run:
+#       workflows: [CI]
+#       types: [in_progress]
+#   permissions: {}
+#   jobs:
+#     start-runners:
+#       uses: aleo-labs-protocol/gh-actions/.github/workflows/start-runner.yml@v2
+#       permissions: { id-token: write, contents: read, actions: read }
+#       with:
+#         role-to-assume: ${{ vars.RUNNER_ROLE_ARN }}
+#         runner-app-id: ${{ vars.RUNNER_APP_ID }}
+#         label: cpu
+#       secrets:
+#         runner_app_key: ${{ secrets.RUNNER_APP_KEY }}
+#
+# The guard here admits a `workflow_run` only for a fork's pull_request run that
+# is in progress, and the run is sized from the triggering workflow's history.
+# The companion must never check out or run the pull request's code, nor put a
+# `workflow_run` field into a `run:` script: the fork controls its branch name,
+# its commit messages and its workflow names.
+#
 # The same workflow starts the CPU boxes for jobs that never needed a GPU: pass
 # `label: cpu`.
 #
@@ -186,10 +214,19 @@ jobs:
     # `== null` rather than an event_name test for the second clause: push,
     # schedule and workflow_dispatch carry no pull_request object at all, so
     # this stays correct for triggers nobody has added yet.
+    #
+    # The third clause serves a `workflow_run` companion (see the header). It
+    # admits only a fork's pull_request run, whose own start job the second
+    # clause skipped, and only `in_progress`: GitHub fires `requested` when an
+    # outside contributor's run is created, before a maintainer approves it.
     if: >-
       github.event_name != 'pull_request_target' &&
       (github.event.pull_request == null ||
-       github.event.pull_request.head.repo.full_name == github.repository)
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.action == 'in_progress' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name != github.repository))
     steps:
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -276,6 +313,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           LABEL: ${{ inputs.label }}
+          # Set only under `workflow_run`: the run whose demand this is.
+          DEMAND_RUN_ID: ${{ github.event.workflow_run.id }}
+          DEMAND_PATH: ${{ github.event.workflow_run.path }}
         run: |
           set -euo pipefail
           # THIS run's own jobs are not in the API yet, and that is not a race:
@@ -302,13 +342,27 @@ jobs:
           # thing that keeps two pushes landing together from each sizing for
           # one run's demand. A workflow path cannot contain @.
           wf_path="${ref#*/}"; wf_path="${wf_path#*/}"; wf_path="${wf_path%%@*}"
+          demand_run="${GITHUB_RUN_ID:-}"
+          # Under `workflow_run`, GITHUB_WORKFLOW_REF names the companion, whose
+          # runs hold no label jobs. The demand is the triggering run's. Its path
+          # comes from a fork, so anything but a plain workflow file is dropped
+          # rather than built into an API URL, and the floor applies.
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_run" ]; then
+            demand_run="${DEMAND_RUN_ID:-}"
+            if [[ "${DEMAND_PATH:-}" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+              wf_path="${DEMAND_PATH}"
+            else
+              wf_path=""
+            fi
+          fi
           wf="${wf_path##*/}"
           if [ -n "${wf}" ]; then
             # SEVERAL completed runs and the largest, not the newest one. A run
             # cancelled while its start job was still going -- a second push to
             # the same branch, or someone hitting cancel -- has only the
-            # ubuntu-latest start job on record, and so does a fork PR, where
-            # the guard skips the start job and everything gated behind it.
+            # ubuntu-latest start job on record, and so does a fork PR in a
+            # caller without a companion, where the guard skips the start job
+            # and everything gated behind it.
             # Reading just the newest would report 0 for those and fall back to
             # the floor: the same silent undersizing this replaces, arrived at
             # by a different route.
@@ -341,7 +395,8 @@ jobs:
           # Runs listed as queued or in_progress can both hold a job still
           # waiting for a runner. This run is excluded: its demand is `own`
           # above, and a rerun whose jobs HAVE been released would otherwise be
-          # counted twice.
+          # counted twice. Under `workflow_run` the triggering run is excluded
+          # too, for the same reason.
           #
           # Both listings are gathered before any are counted, then deduplicated
           # by run id: a run that is `queued` during the first call and
@@ -361,6 +416,7 @@ jobs:
           while read -r run path; do
             [ -n "${run}" ] || continue
             [ "${run}" = "${GITHUB_RUN_ID:-}" ] && continue
+            [ "${run}" = "${demand_run}" ] && continue
             jobs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs?per_page=100" --jq '.jobs[]') \
               || bail "could not list the jobs of run ${run}"
             k=$(jq --arg l "${LABEL}" -s '[.[] | select(.status == "queued" and (.labels | index($l)))] | length' <<<"${jobs}")
