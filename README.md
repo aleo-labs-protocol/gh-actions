@@ -67,9 +67,13 @@ To run an approved fork's fleet jobs, a caller:
 - lets its fleet jobs run when the start job succeeded **or was skipped**, and
   keeps them to its own repository, so a mirror does not queue them for a box it
   cannot have;
-- adds a companion workflow on `workflow_run`, `types: [in_progress]`, whose
-  only job calls `start-runner.yml`. The header of `start-runner.yml` has the
-  block to copy.
+- adds a companion workflow on `workflow_run`, `types: [in_progress]`, with
+  one job per fleet label that calls `start-runner.yml`. The header of
+  `start-runner.yml` has the block to copy;
+- sets fork-PR approval to all outside contributors
+  (`all_external_contributors`). Under GitHub's default, first-time
+  contributors only, a returning contributor's run starts unapproved.
+  Organization members and collaborators are never asked for approval.
 
 GitHub runs the companion from the default branch with the caller's secrets, so
 a fork cannot edit it. `in_progress` fires when the approved run starts;

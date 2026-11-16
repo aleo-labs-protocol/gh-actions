@@ -361,6 +361,10 @@ ck "guard rejects pull_request_target" \
 # `in_progress` only after approval.
 ck "guard admits workflow_run only for a fork run in progress" \
    "$(grep -c "github.event.action == 'in_progress'" "$WF")" "1"
+ck "guard admits workflow_run only for a pull_request run" \
+   "$(grep -v '^#' "$WF" | grep -c "github.event.workflow_run.event == 'pull_request'")" "1"
+ck "guard admits workflow_run only for a fork" \
+   "$(grep -v '^#' "$WF" | grep -c "github.event.workflow_run.head_repository.full_name != github.repository")" "1"
 
 # Values reach these scripts through `env:`, never interpolated into the body.
 # That is what keeps them lintable -- a `${{ }}` inside a run block is not valid
@@ -827,7 +831,8 @@ case "$url" in
   */actions/workflows/*/runs*) [[ -n "${HIST_FAIL:-}" ]] && exit 1
                                # HIST_WF names the one workflow whose history exists.
                                [[ -z "${HIST_WF:-}" || "$url" == */workflows/"${HIST_WF}"/runs* ]] || exit 0
-                               for r in ${PREV_RUNS:-}; do echo "$r"; done ;;
+                               # An entry is id or id:conclusion.
+                               for r in ${PREV_RUNS:-}; do echo "${r/:/ }"; done ;;
   *"runs?status=queued"*)      [[ -n "${RUNS_FAIL:-}" ]] && exit 1
                                for r in $QUEUED_RUNS;  do p="PATH_$r"; echo "$r ${!p:-.github/workflows/other.yml}"; done ;;
   *"runs?status=in_progress"*) [[ -n "${RUNS_FAIL:-}" ]] && exit 1
@@ -900,6 +905,9 @@ wfrun() { GITHUB_EVENT_NAME=workflow_run RUN_ID=50 \
           DEMAND_RUN_ID=3 DEMAND_PATH="$1" HIST_WF="${2:-ci.yml}" queue; }
 ck "workflow_run sizes from the triggering workflow" "$(wfrun .github/workflows/ci.yml)" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
+ck "workflow_run credits a sibling run of the triggering workflow" \
+   "$(EXTRA_RUN=4 wfrun .github/workflows/ci.yml)" \
+   "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 4|queued=6"
 # The fork controls its workflow file names. A path that is not a plain file
 # under .github/workflows/ is not used to build an API URL.
 ck "a workflow_run path with odd characters is not used" \
@@ -913,6 +921,11 @@ ck "a concurrent run of a different workflow does not" \
 # over-provisions -- and for a sibling run of this workflow it adds a whole
 # `own` worth twice.
 ck "a run in both listings is counted once" "$(QUEUED_RUNS_EXTRA=1 queue)" \
+   "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
+# A fork run awaiting approval is listed as completed with no jobs. Five of
+# them must not push the real runs out of the window.
+ck "runs awaiting approval do not fill the history window" \
+   "$(PREV_RUNS="11:action_required 12:action_required 13:action_required 14:action_required 15:action_required 9:success" queue)" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
 ck "a workflow with no completed runs has no history to size by" "$(PREV_RUNS='' queue)" \
    "cuda jobs this workflow releases per run: 0|queued cuda jobs in other o/r runs: 2|queued=2"

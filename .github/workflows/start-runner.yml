@@ -56,9 +56,19 @@
 #         label: cpu
 #       secrets:
 #         runner_app_key: ${{ secrets.RUNNER_APP_KEY }}
+#       if: >-
+#         github.event.workflow_run.event == 'pull_request' &&
+#         github.event.workflow_run.head_repository.full_name != github.repository
 #
-# The guard here admits a `workflow_run` only for a fork's pull_request run that
-# is in progress, and the run is sized from the triggering workflow's history.
+# The caller needs one such job per label its fleet jobs use. The guard here
+# also admits a `workflow_run` only for a fork's pull_request run that is in
+# progress, and the run is sized from the triggering workflow's history.
+#
+# Approval is what admits a fork's code to the fleet, so the caller must set
+# fork-PR approval to all outside contributors (`all_external_contributors`).
+# Under GitHub's default, first-time contributors only, a returning contributor's
+# run goes straight to `in_progress`. Organization members and collaborators
+# are never asked for approval, so their fork PRs run on the fleet regardless.
 # The companion must never check out or run the pull request's code, nor put a
 # `workflow_run` field into a `run:` script: the fork controls its branch name,
 # its commit messages and its workflow names.
@@ -366,8 +376,14 @@ jobs:
             # Reading just the newest would report 0 for those and fall back to
             # the floor: the same silent undersizing this replaces, arrived at
             # by a different route.
-            if hist=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=completed&per_page=5" \
-                        --jq '.workflow_runs[].id' 2>/dev/null); then
+            #
+            # A fork run awaiting approval is listed as completed, conclusion
+            # `action_required`, with no jobs at all. Those are dropped before
+            # the five are taken, or a burst of unapproved fork PRs would fill
+            # the window with zeros.
+            if hist=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=completed&per_page=20" \
+                        --jq '.workflow_runs[] | "\(.id) \(.conclusion)"' 2>/dev/null); then
+              hist=$(awk '$2 != "action_required" { print $1 }' <<<"${hist}" | head -n 5)
               for r in ${hist}; do
                 # Job records, not queue: every job the run created that carried
                 # the label, whatever it concluded. A matrix is counted by its
@@ -395,8 +411,8 @@ jobs:
           # Runs listed as queued or in_progress can both hold a job still
           # waiting for a runner. This run is excluded: its demand is `own`
           # above, and a rerun whose jobs HAVE been released would otherwise be
-          # counted twice. Under `workflow_run` the triggering run is excluded
-          # too, for the same reason.
+          # counted twice. Under `workflow_run` the run excluded is the
+          # triggering one; the companion's own run holds no label jobs.
           #
           # Both listings are gathered before any are counted, then deduplicated
           # by run id: a run that is `queued` during the first call and
@@ -415,7 +431,6 @@ jobs:
           others=0
           while read -r run path; do
             [ -n "${run}" ] || continue
-            [ "${run}" = "${GITHUB_RUN_ID:-}" ] && continue
             [ "${run}" = "${demand_run}" ] && continue
             jobs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs?per_page=100" --jq '.jobs[]') \
               || bail "could not list the jobs of run ${run}"
