@@ -37,7 +37,10 @@
 #
 # A fork's `pull_request` run gets no secrets and no OIDC token, so the guard
 # skips its start job. For the fork's fleet jobs to run anyway -- they must
-# accept a skipped start job -- the caller adds a companion workflow. GitHub
+# accept a skipped start job, and also need a hosted job such as
+# check-shared-refs -- the caller adds a companion workflow. GitHub reports a
+# run as `in_progress` only once none of its ready jobs waits for a runner, so
+# fleet jobs ready at approval would hold the run, and the companion, back. GitHub
 # runs it from the default branch, with the caller's secrets, when the fork's
 # run starts, which for an outside contributor is when a maintainer approves it:
 #
