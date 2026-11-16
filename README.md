@@ -57,6 +57,32 @@ Preflight and report are steps inside a job the caller must own, because the
 test command differs per repository, so they are composite actions — a reusable
 workflow cannot be interleaved with a caller's own steps.
 
+## Fork pull requests on the fleet
+
+A fork's `pull_request` run gets no secrets and no OIDC token, so the guard
+above skips its start job. GitHub holds an outside contributor's run until a
+maintainer approves it, and that approval is what admits the code to the fleet.
+To run an approved fork's fleet jobs, a caller:
+
+- lets its fleet jobs run when the start job succeeded **or was skipped**, and
+  keeps them to its own repository, so a mirror does not queue them for a box it
+  cannot have;
+- adds a companion workflow on `workflow_run`, `types: [in_progress]`, with
+  one job per fleet label that calls `start-runner.yml`. The header of
+  `start-runner.yml` has the block to copy;
+- sets fork-PR approval to all outside contributors
+  (`all_external_contributors`). Under GitHub's default, first-time
+  contributors only, a returning contributor's run starts unapproved.
+  Organization members and collaborators are never asked for approval.
+
+GitHub runs the companion from the default branch with the caller's secrets, so
+a fork cannot edit it. `in_progress` fires when the approved run starts;
+`requested` fires before approval. `start-runner.yml` admits a `workflow_run`
+only for an in-progress fork pull_request run, and sizes it from the triggering
+workflow's history. The companion must never check out the pull request or put
+a `workflow_run` field into a `run:` script: the fork controls its branch name,
+its commit messages and its workflow names.
+
 ## Giving a caller the fleet-wide view
 
 Optional. Without it a caller sizes the fleet from its own queue alone, which is
