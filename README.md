@@ -262,13 +262,12 @@ protected. That protection is what makes the script trusted.
 
 The script runs in a step with no token, and the checkout keeps no
 credentials. Git asks a credential helper, which answers only in the steps
-whose env has the token: the merge before the script and the push after it. This is not a sandbox: the script shares the runner and the
-checkout with the push step. It keeps the token out of reach of a script that
-misbehaves, not one written to attack. The commit and the push run no git
-hooks, so a hook the script installs, say through a cargo build, never sees
-the token. Without credentials, the script cannot
-fetch objects the merge did not, so in a private repository it should read
-only the working tree and the index stages (`git show :1:path`, `:2:`, `:3:`).
+whose env has the token: the push after the script. This is not a sandbox:
+the script shares the runner and the checkout with the push step. It keeps the
+token out of reach of a script that misbehaves, not one written to attack. The
+commit and the push run no git hooks, so a hook the script installs, say
+through a cargo build, never sees the token. The checkout is a full clone, so
+the script can read any branch or tag without fetching.
 
 ## Mirroring branches
 
