@@ -150,8 +150,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.target }}
-          # A full clone: a partial clone's on-demand blob fetches fail during
-          # the merge with "upload-pack: not our ref".
+          # A full clone. In a blobless one, git 2.56.1's on-demand blob fetch
+          # during the merge asks for an object that exists nowhere and fails
+          # with "upload-pack: not our ref".
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
           persist-credentials: false
