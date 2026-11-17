@@ -67,6 +67,11 @@ To run an approved fork's fleet jobs, a caller:
 - lets its fleet jobs run when the start job succeeded **or was skipped**, and
   keeps them to its own repository, so a mirror does not queue them for a box it
   cannot have;
+- makes its fleet jobs also need a hosted job, such as `check-shared-refs`.
+  GitHub reports a run as `in_progress`, and fires the event the companion
+  listens for, only once none of its ready jobs waits for a runner. Without a
+  hosted job ahead of them, a fork's fleet jobs wait for boxes that only that
+  event starts;
 - adds a companion workflow on `workflow_run`, `types: [in_progress]`, with
   one job per fleet label that calls `start-runner.yml`. The header of
   `start-runner.yml` has the block to copy;
