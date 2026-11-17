@@ -150,8 +150,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.target }}
+          # A full clone: a partial clone's on-demand blob fetches fail during
+          # the merge with "upload-pack: not our ref".
           fetch-depth: 0
-          filter: blob:none
           token: ${{ steps.app.outputs.token }}
           persist-credentials: false
 
@@ -164,8 +165,7 @@ jobs:
         run: |
           set -euo pipefail
           # The token is read when git asks, so git authenticates only in a step
-          # whose env has GH_TOKEN: the partial clone's fetches here, and the
-          # push. The config holds no token.
+          # whose env has GH_TOKEN: the push. The config holds no token.
           # ci.yml runs this line on a real runner.
           # shellcheck disable=SC2016
           helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
