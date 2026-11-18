@@ -4,7 +4,7 @@
 # then runs this as its last step. Nothing here runs the caller's build, so the
 # App token never reaches a build script.
 name: Bump pull request
-description: Commit a pin bump to one branch and open or update its pull request, listing the source's first-parent commits.
+description: Commit a pin bump to one branch and open or update its pull request, listing the source's first-parent commits and the pull requests each merge brought in.
 
 inputs:
   token:
@@ -44,6 +44,10 @@ inputs:
     description: Markdown to put first in the pull request body.
     required: false
     default: ''
+  upstreams:
+    description: Repositories the source merges from, one `owner/name rev` per line, where rev is a commit-ish in source-dir. A merged pull request that rev contains is linked to that repository instead of source-repo.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -63,6 +67,7 @@ runs:
         TITLE: ${{ inputs.title }}
         PATHS: ${{ inputs.paths }}
         PREAMBLE: ${{ inputs.preamble }}
+        UPSTREAMS: ${{ inputs.upstreams }}
       run: |
         set -euo pipefail
         bot="${APP_SLUG}[bot]"
@@ -82,6 +87,34 @@ runs:
           exit 0
         fi
         tree=$(git write-tree)
+
+        known=$(sed '/^[[:space:]]*$/d' <<< "$UPSTREAMS")
+        while read -r up rev; do
+          if [ -n "$up" ] && ! git -C "$SOURCE_DIR" rev-parse --verify --quiet "$rev^{commit}" > /dev/null; then
+            echo "::error::$SOURCE_DIR has no $rev, the upstream $up." >&2
+            exit 1
+          fi
+        done <<< "$known"
+        # A zero-width space after each @, so a subject mentions no one.
+        zw='@&#8203;'
+        entry() { # indent, sha
+          local subject pr_title up rev owner=$SOURCE_REPO
+          subject=$(git -C "$SOURCE_DIR" log -1 --format=%s "$2")
+          if [[ $subject =~ ^Merge\ pull\ request\ \#([0-9]+)\  ]]; then
+            while read -r up rev; do
+              if [ -n "$up" ] && git -C "$SOURCE_DIR" merge-base --is-ancestor "$2" "$rev"; then
+                owner=$up
+                break
+              fi
+            done <<< "$known"
+            pr_title=$(git -C "$SOURCE_DIR" log -1 --format=%b "$2" | sed -n '/./{p;q}')
+            printf -- '%s- %s#%s%s\n' "$1" "$owner" "${BASH_REMATCH[1]}" "${pr_title:+: ${pr_title//@/"$zw"}}"
+          else
+            # Backticks in single quotes are Markdown.
+            # shellcheck disable=SC2016
+            printf -- '%s- `%s` %s\n' "$1" "${2:0:9}" "${subject//@/"$zw"}"
+          fi
+        }
 
         # --head matches a fork's branch of the same name too.
         pr=$(gh pr list --head "$PR_BRANCH" --base "$BASE_BRANCH" --state open --json number,isCrossRepository \
@@ -128,19 +161,12 @@ runs:
           fi
           printf 'Changes: %s/%s/compare/%s...%s\n\n' "$GITHUB_SERVER_URL" "$SOURCE_REPO" "$CURRENT" "$LATEST"
           printf '## First-parent commits on `%s`\n\n' "$SOURCE_BRANCH"
-          # A zero-width space after each @, so a subject mentions no one.
-          zw='@&#8203;'
           git -C "$SOURCE_DIR" rev-list --first-parent "$CURRENT..$LATEST" | while read -r sha; do
-            subject=$(git -C "$SOURCE_DIR" log -1 --format=%s "$sha")
-            if [[ $subject =~ ^Merge\ pull\ request\ \#([0-9]+)\  ]]; then
-              pr_title=$(git -C "$SOURCE_DIR" log -1 --format=%b "$sha" | sed -n '/./{p;q}')
-              if [ -n "$pr_title" ]; then
-                printf -- '- %s#%s: %s\n' "$SOURCE_REPO" "${BASH_REMATCH[1]}" "${pr_title//@/"$zw"}"
-              else
-                printf -- '- %s#%s\n' "$SOURCE_REPO" "${BASH_REMATCH[1]}"
-              fi
-            else
-              printf -- '- `%s` %s\n' "${sha:0:9}" "${subject//@/"$zw"}"
+            entry '' "$sha"
+            # The pull requests a merge brought in.
+            if git -C "$SOURCE_DIR" rev-parse --verify --quiet "$sha^2" > /dev/null; then
+              git -C "$SOURCE_DIR" rev-list --merges --grep='^Merge pull request #[0-9]' "$sha^1..$sha^2" |
+                while read -r nested; do entry '  ' "$nested"; done
             fi
           done
           printf '\nWhen `%s` in %s or `%s` in this repository moves, the next run rebuilds this branch from `%s` and force-pushes it. Once someone else pushes to the branch, for example to fix a breaking change, the workflow comments instead.\n' \
