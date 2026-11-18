@@ -414,14 +414,14 @@ creates the App token and runs `bump-pr` as its last step.
 - It commits `paths` to `pr-branch`, rebuilt from the base, and force-pushes
   it. A run whose tree matches the branch's tip leaves it alone.
 - The body lists the source branch's first-parent commits. A merged pull
-  request is listed by its title, or as `owner/repo#N` when its merge commit
-  has no body. Under each merge it lists the pull requests that merge brought
+  request is a link, with the title from its merge commit, or from the API
+  when that has no body and the token can read the repository. Under each merge it lists the pull requests that merge brought
   in. An `@` mentions no one. The body warns when the current pin has commits
   that are not on the branch.
 - `upstreams` names the repositories the source merges from, one
   `owner/name rev` per line. The caller fetches each `rev` into `source-dir`,
   and a pull request merge that `rev` contains links to that repository
-  instead of `source-repo`.
+  instead of `source-repo`. The first line that matches wins.
 - Once the branch's tip is a commit that someone other than the App wrote or
   committed, the action comments once for each new tip of the source branch
   instead. Close the pull request to hand the branch back.

@@ -8,7 +8,7 @@ description: Commit a pin bump to one branch and open or update its pull request
 
 inputs:
   token:
-    description: A GitHub App token with contents, pull-requests and workflows write. A push with github.token starts no CI.
+    description: A GitHub App token with contents, pull-requests and workflows write. It also reads the titles of pull requests whose merge commit has no body. A push with github.token starts no CI.
     required: true
   app-slug:
     description: The App's slug, which the commit and the someone-else-pushed check use.
@@ -45,7 +45,7 @@ inputs:
     required: false
     default: ''
   upstreams:
-    description: Repositories the source merges from, one `owner/name rev` per line, where rev is a commit-ish in source-dir. A merged pull request that rev contains is linked to that repository instead of source-repo.
+    description: Repositories the source merges from, one `owner/name rev` per line, where rev is a commit-ish in source-dir. A merged pull request that rev contains is linked to that repository instead of source-repo. The first line that matches wins.
     required: false
     default: ''
 
@@ -98,9 +98,10 @@ runs:
         # A zero-width space after each @, so a subject mentions no one.
         zw='@&#8203;'
         entry() { # indent, sha
-          local subject pr_title up rev owner=$SOURCE_REPO
+          local subject pr_title n up rev owner=$SOURCE_REPO
           subject=$(git -C "$SOURCE_DIR" log -1 --format=%s "$2")
           if [[ $subject =~ ^Merge\ pull\ request\ \#([0-9]+)\  ]]; then
+            n=${BASH_REMATCH[1]}
             while read -r up rev; do
               if [ -n "$up" ] && git -C "$SOURCE_DIR" merge-base --is-ancestor "$2" "$rev"; then
                 owner=$up
@@ -108,7 +109,9 @@ runs:
               fi
             done <<< "$known"
             pr_title=$(git -C "$SOURCE_DIR" log -1 --format=%b "$2" | sed -n '/./{p;q}')
-            printf -- '%s- %s#%s%s\n' "$1" "$owner" "${BASH_REMATCH[1]}" "${pr_title:+: ${pr_title//@/"$zw"}}"
+            # A merge commit without a body. The token may not read the repository.
+            [ -n "$pr_title" ] || pr_title=$(gh api "repos/$owner/pulls/$n" --jq .title 2> /dev/null) || pr_title=
+            printf -- '%s- [%s#%s](%s/%s/pull/%s)%s\n' "$1" "${owner#*/}" "$n" "$GITHUB_SERVER_URL" "$owner" "$n" "${pr_title:+: ${pr_title//@/"$zw"}}"
           else
             # Backticks in single quotes are Markdown.
             # shellcheck disable=SC2016
@@ -163,9 +166,9 @@ runs:
           printf '## First-parent commits on `%s`\n\n' "$SOURCE_BRANCH"
           git -C "$SOURCE_DIR" rev-list --first-parent "$CURRENT..$LATEST" | while read -r sha; do
             entry '' "$sha"
-            # The pull requests a merge brought in.
+            # The pull requests a merge brought in that the pin does not have.
             if git -C "$SOURCE_DIR" rev-parse --verify --quiet "$sha^2" > /dev/null; then
-              git -C "$SOURCE_DIR" rev-list --merges --grep='^Merge pull request #[0-9]' "$sha^1..$sha^2" |
+              git -C "$SOURCE_DIR" rev-list --merges --grep='^Merge pull request #[0-9]\+ ' "$sha^@" "^$sha^1" "^$CURRENT" |
                 while read -r nested; do entry '  ' "$nested"; done
             fi
           done

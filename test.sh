@@ -2021,7 +2021,7 @@ open('$bp_tmp/step.sh', 'w').write(d['runs']['steps'][0]['run'])
 "
 # The source: a pin, then two merged pull requests, one whose merge commit has
 # no body, a merge of an upstream that has merged two of its own, one of them
-# stacked, and a direct commit. An extra commit off the branch is a diverged pin.
+# stacked with no body, and a direct commit. An extra commit off the branch is a diverged pin.
 bp_src="$bp_tmp/src"
 git init -q "$bp_src"
 bp_s() { git -C "$bp_src" "$@"; }
@@ -2033,7 +2033,7 @@ bp_s merge -q --no-ff -m "Merge pull request #8 from o/y" y
 bp_s checkout -q -b up "$bp_pin"
 bp_s checkout -q -b u1; bp_s commit -q --allow-empty -m "u1 work"
 bp_s checkout -q -b u0; bp_s commit -q --allow-empty -m "u0 work"; bp_s checkout -q u1
-bp_s merge -q --no-ff -m "Merge pull request #2 from o/u0" -m "Stacked" u0; bp_s checkout -q up
+bp_s merge -q --no-ff -m "Merge pull request #2 from o/u0" u0; bp_s checkout -q up
 bp_s merge -q --no-ff -m "Merge pull request #3 from o/u1" -m "Upstream @carol" u1
 bp_s checkout -q -b sync main; bp_s merge -q --no-ff -m "Merge up into main" up
 bp_s checkout -q -b z; bp_s commit -q --allow-empty -m "z work"; bp_s checkout -q sync
@@ -2069,6 +2069,8 @@ case "$*" in
       | jq -r "$(jq_arg "$@")"
     seq 100000;;
   "api users/"*) echo 12345;;
+  "api repos/o/u/pulls/2 --jq .title") echo "Stacked by @dave";;
+  "api repos/o/s/pulls/"*) echo "Not Found" >&2; exit 1;;
   "pr create"*|"pr edit"*|"pr comment"*)
     echo "gh $1 $2" >> "$BP_TMP/log"
     prev=; for a in "$@"; do
@@ -2098,12 +2100,12 @@ ck "new: opens, past a fork's"       "$(bp_run "$bp_latest")$(bp_log)" "0gh pr c
 ck "new: the branch pins latest"     "$(git -C "$bp_tmp/o.git" show ci/bump:pin)" "$bp_latest"
 ck "new: on main's tip"              "$(git -C "$bp_tmp/o.git" rev-parse ci/bump^)" "$(git -C "$bp_tmp/o.git" rev-parse main)"
 ck "new: as the bot"                 "$(git -C "$bp_tmp/o.git" log -1 --format='%an %ae' ci/bump)" "merge-bot[bot] 12345+merge-bot[bot]@users.noreply.github.com"
-ck "a merge with a title"            "$(bp_line "- o/s#7: Add @&#8203;alice's thing")" "1"
-ck "a merge without one"             "$(bp_line "- o/s#8")" "1"
+ck "a merge with a title"            "$(bp_line "- [s#7](https://github.com/o/s/pull/7): Add @&#8203;alice's thing")" "1"
+ck "a merge without one"             "$(bp_line "- [s#8](https://github.com/o/s/pull/8)")" "1"
 ck "a direct commit"                 "$(bp_line "- \`${bp_latest:0:9}\` Fix by @&#8203;bob")" "1"
 ck "only first-parent commits"       "$(grep -c '^- ' "$bp_tmp/body.pr-create")" "4"
-ck "a merge's pull requests, linked to their repositories" "$(grep -A4 -xF -- '- o/s#9: Merge up' "$bp_tmp/body.pr-create" | tail -4 | tr '\n' '|')" \
-   "  - o/s#10: Fix the sync|  - o/u#3: Upstream @&#8203;carol|  - o/u#2: Stacked|- o/s#8|"
+ck "a merge's pull requests, linked to their repositories" "$(grep -A4 -xF -- '- [s#9](https://github.com/o/s/pull/9): Merge up' "$bp_tmp/body.pr-create" | tail -4 | tr '\n' '|')" \
+   "  - [s#10](https://github.com/o/s/pull/10): Fix the sync|  - [u#3](https://github.com/o/u/pull/3): Upstream @&#8203;carol|  - [u#2](https://github.com/o/u/pull/2): Stacked by @&#8203;dave|- [s#8](https://github.com/o/s/pull/8)|"
 ck "no warning on an upgrade"        "$(grep -c WARNING "$bp_tmp/body.pr-create")" "0"
 ck "the same tree: nothing"          "$(bp_run "$bp_latest" BP_PR=5)$(bp_log)" "0"
 bp_move_base
@@ -2121,8 +2123,9 @@ ck "diverged: warns"                 "$(bp_line "> The current pin \`${bp_off:0:
 ck "the preamble comes first"        "$(head -3 "$bp_tmp/body.pr-create" | cut -c1-6 | tr '\n' '|')" "> note||Bumps |"
 ck "an unchanged pin: nothing"       "$(bp_run "$bp_pin")$(bp_log)" "0"
 ck "checkout's token: refused"       "$(bp_run "$bp_latest" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0=x)$(bp_log)" "1"
-ck "an upstream's own merge"         "$(bp_run "$(bp_s rev-parse up)")$(grep -c '^- o/u#3: ' "$bp_tmp/body.pr-create")" "01"
-ck "no upstreams: the source's"      "$(bp_run "$bp_latest" UPSTREAMS=)$(grep -c '^  - o/s#' "$bp_tmp/body.pr-create")" "03"
+ck "an upstream's own merge"         "$(bp_run "$(bp_s rev-parse up)")$(grep -c '^- \[u#3\]' "$bp_tmp/body.pr-create")" "01"
+ck "no upstreams: the source's"      "$(bp_run "$bp_latest" UPSTREAMS=)$(grep -c '^  - \[s#' "$bp_tmp/body.pr-create")" "03"
+ck "not the pin's own"               "$(bp_run "$bp_latest" CURRENT="$(bp_s rev-parse up)")$(grep '^  - ' "$bp_tmp/body.pr-create" | cut -c1-10)" "0  - [s#10]"
 ck "an unknown upstream rev fails"   "$(bp_run "$bp_latest" UPSTREAMS='o/u nope')$(bp_log)" "1"
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
