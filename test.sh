@@ -828,11 +828,38 @@ cat > "$sc_tmp/bin/gh" <<'GHEOF'
 # The URL is whichever argument starts with a slash: --paginate shifts it.
 url=""; for a in "$@"; do [[ "$a" == /* ]] && { url="$a"; break; }; done
 case "$url" in
-  */actions/workflows/*/runs*) [[ -n "${HIST_FAIL:-}" ]] && exit 1
-                               # HIST_WF names the one workflow whose history exists.
-                               [[ -z "${HIST_WF:-}" || "$url" == */workflows/"${HIST_WF}"/runs* ]] || exit 0
-                               # An entry is id or id:conclusion.
-                               for r in ${PREV_RUNS:-}; do echo "${r/:/ }"; done ;;
+  */actions/workflows/*/runs*)
+    # The query fields, as the API reads them: event= and branch= filter the
+    # listing server-side, exact match only. Each listing's filters are logged
+    # to HIST_LOG, one line per call, so a test can see what was asked for.
+    want_event=""; want_branch=""; filters=""; jqx=""; prev=""
+    for a in "$@"; do
+      if [[ "$prev" == -f ]]; then
+        case "$a" in
+          event=*)  want_event="${a#event=}";  filters="${filters:+$filters }$a" ;;
+          branch=*) want_branch="${a#branch=}"; filters="${filters:+$filters }$a" ;;
+        esac
+      fi
+      [[ "$prev" == --jq ]] && jqx="$a"
+      prev="$a"
+    done
+    [[ -n "${HIST_LOG:-}" ]] && echo "${filters:-any}" >> "$HIST_LOG"
+    [[ -n "${HIST_FAIL:-}" ]] && exit 1
+    # The fallback listing fails on its own, for a kind listing that did not.
+    [[ -n "${HIST_FAIL_ANY:-}" && -z "$filters" ]] && exit 1
+    # HIST_WF names the one workflow whose history exists.
+    [[ -z "${HIST_WF:-}" || "$url" == */workflows/"${HIST_WF}"/runs* ]] || exit 0
+    # An entry is id[:conclusion[:event[:branch]]], newest first; a run with
+    # no event given is a push to main. Served as the API's JSON, through the
+    # step's own --jq.
+    for r in ${PREV_RUNS:-}; do
+      IFS=: read -r id concl ev br <<<"$r"
+      ev="${ev:-push}"; br="${br:-main}"
+      [[ -z "$want_event"  || "$ev" == "$want_event"  ]] || continue
+      [[ -z "$want_branch" || "$br" == "$want_branch" ]] || continue
+      jq -n --argjson id "$id" --arg c "${concl:-success}" --arg e "$ev" --arg b "$br" \
+        '{id: $id, conclusion: $c, event: $e, head_branch: $b}'
+    done | jq -s '{workflow_runs: .}' | jq -r "$jqx" ;;
   *"runs?status=queued"*)      [[ -n "${RUNS_FAIL:-}" ]] && exit 1
                                for r in $QUEUED_RUNS;  do p="PATH_$r"; echo "$r ${!p:-.github/workflows/other.yml}"; done ;;
   *"runs?status=in_progress"*) [[ -n "${RUNS_FAIL:-}" ]] && exit 1
@@ -848,8 +875,10 @@ GHEOF
 chmod +x "$sc_tmp/bin/gh"
 
 queue() { # -> the two count lines, then what it handed the plan step
-  : > "$sc_tmp/out"
+  : > "$sc_tmp/out"; : > "$sc_tmp/hist"
+  # EVENT and REF_NAME, not the GITHUB_ names, which CI's own run sets.
   PATH="$sc_tmp/bin:$PATH" GITHUB_REPOSITORY=o/r GITHUB_OUTPUT="$sc_tmp/out" LABEL=cuda \
+  GITHUB_EVENT_NAME="${EVENT-push}" GITHUB_REF_NAME="${REF_NAME-main}" HIST_LOG="$sc_tmp/hist" \
   GITHUB_RUN_ID="${RUN_ID:-3}" GITHUB_WORKFLOW_REF="${WF_REF:-o/r/.github/workflows/ci.yml@refs/heads/main}" \
   PREV_RUNS="${PREV_RUNS-9 8}" \
   JOBS_9="completed:self-hosted,linux,x64,cuda,sm_89 failure:self-hosted,cuda skipped:ubuntu-latest" \
@@ -859,7 +888,7 @@ queue() { # -> the two count lines, then what it handed the plan step
   JOBS_2="queued:ubuntu-latest queued:self-hosted,cuda" \
   JOBS_3="in_progress:ubuntu-latest queued:self-hosted,cuda in_progress:self-hosted,cuda" \
   JOBS_4="in_progress:ubuntu-latest" PATH_4="${PATH_4:-.github/workflows/ci.yml}" \
-  bash "$sc_tmp/queue.sh" 2>&1 | grep -E '^cuda jobs|^queued cuda' | tr '\n' '|'; cat "$sc_tmp/out"
+  bash "$sc_tmp/queue.sh" 2>&1 | tee "$sc_tmp/log" | grep -E '^cuda jobs|^queued cuda' | tr '\n' '|'; cat "$sc_tmp/out"
 }
 # THIS run's jobs do not exist yet and will not until this workflow finishes:
 # they carry `needs:` on it, so GitHub has not created them. Counting the API
@@ -900,9 +929,10 @@ ck "a ref containing @ still credits a sibling run" \
 # companion, whose runs hold no label jobs. The demand is the triggering run's:
 # its workflow's history sizes it, and the run itself is left out of the other
 # runs, or its queued jobs would count on top of that history.
-wfrun() { GITHUB_EVENT_NAME=workflow_run RUN_ID=50 \
+wfrun() { EVENT=workflow_run RUN_ID=50 \
           WF_REF="o/r/.github/workflows/fork-pr-runners.yml@refs/heads/main" \
-          DEMAND_RUN_ID=3 DEMAND_PATH="$1" HIST_WF="${2:-ci.yml}" queue; }
+          DEMAND_RUN_ID=3 DEMAND_PATH="$1" DEMAND_EVENT="${DEMAND_EVENT-pull_request}" HIST_WF="${2:-ci.yml}" \
+          PREV_RUNS="${PREV_RUNS-9:success:pull_request:fork 8:success:pull_request:fork}" queue; }
 ck "workflow_run sizes from the triggering workflow" "$(wfrun .github/workflows/ci.yml)" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
 ck "workflow_run credits a sibling run of the triggering workflow" \
@@ -929,12 +959,82 @@ ck "runs awaiting approval do not fill the history window" \
    "cuda jobs this workflow releases per run: 2|queued cuda jobs in other o/r runs: 2|queued=4"
 ck "a workflow with no completed runs has no history to size by" "$(PREV_RUNS='' queue)" \
    "cuda jobs this workflow releases per run: 0|queued cuda jobs in other o/r runs: 2|queued=2"
+
+# A workflow releases a different set of jobs per kind of run, so the history
+# is runs of the same kind. The fixture is one workflow's completed runs, newest
+# first, each with a different count: snarkVM's 6 on a pull request, 14 on a
+# push to its default branch, 19 on a release push.
+cj() { local i s=""; for ((i = 0; i < $1; i++)); do s+="completed:self-hosted,cuda "; done; printf '%s' "$s"; }
+kind_runs="31:success:pull_request:feat-a 32:success:push:main 34:success:push:release/v2
+  35:success:workflow_dispatch:main 36:success:push:release/v1 37:success:push:dev
+  33:success:push:release-notes 38:action_required:pull_request:fork"
+# -> the filters each history listing sent (`any` for none), then the history
+#    and demand lines
+sized() {
+  PREV_RUNS="${PREV_RUNS-$kind_runs}" JOBS_31="$(cj 6)" JOBS_32="$(cj 14)" JOBS_34="$(cj 19)" \
+  JOBS_35="$(cj 17)" JOBS_36="$(cj 18)" JOBS_37="$(cj 10)" JOBS_33="$(cj 30)" queue >/dev/null
+  paste -sd';' "$sc_tmp/hist" | tr '\n' '|'
+  grep -E '^cuda (history|jobs this)' "$sc_tmp/log" | sed 's/^cuda //' | tr '\n' '|'
+}
+ck "a pull request: pull requests only" "$(EVENT=pull_request REF_NAME=7/merge sized)" \
+   "event=pull_request|history: largest of 1 pull_request run(s)|jobs this workflow releases per run: 6|"
+ck "a push to main: that branch, filtered by the API" "$(sized)" \
+   "event=push branch=main|history: largest of 1 push on main run(s)|jobs this workflow releases per run: 14|"
+# release/v3 has no run of its own, and the API matches a branch exactly, so
+# every push is listed and the class is matched here. release-notes has no
+# `/`: it is its own class, not release/*.
+ck "a push to release/v3: every release/ branch" "$(REF_NAME=release/v3 sized)" \
+   "event=push|history: largest of 2 push on release/* run(s)|jobs this workflow releases per run: 19|"
+ck "a push to another branch: that branch" "$(REF_NAME=dev sized)" \
+   "event=push branch=dev|history: largest of 1 push on dev run(s)|jobs this workflow releases per run: 10|"
+# A dispatch's jobs follow from the event: snarkVM releases its release-only
+# jobs on every dispatch, whatever the branch, and most dispatches are on a
+# one-off branch with no history of its own.
+ck "a dispatch: dispatches on any branch" "$(EVENT=workflow_dispatch REF_NAME=release/v9 sized)" \
+   "event=workflow_dispatch|history: largest of 1 workflow_dispatch run(s)|jobs this workflow releases per run: 17|"
+# A kind with no run on record is sized from the largest of a wider window of
+# every kind: the kinds that miss are the rare ones, and those are the large
+# ones. The 30 is seventh, past the five a kind reads.
+ck "no run of the kind: the largest of the last 20" "$(EVENT=schedule sized)" \
+   "event=schedule;any|history: no schedule run released a cuda job; largest of the last 7 run(s) of any kind|jobs this workflow releases per run: 30|"
+ck "and no further than 20" \
+   "$(EVENT=schedule PREV_RUNS="$(printf '8 %.0s' {1..20}) 9" sized)" \
+   "event=schedule;any|history: no schedule run released a cuda job; largest of the last 20 run(s) of any kind|jobs this workflow releases per run: 0|"
+# Runs of the kind that all released nothing -- cancelled at their start job --
+# say nothing about this run, which calling this workflow says will release
+# something.
+ck "runs of the kind that released nothing: the fallback too" \
+   "$(EVENT=pull_request PREV_RUNS="8:success:pull_request:a 9:success:push:main" sized)" \
+   "event=pull_request;any|history: no pull_request run released a cuda job; largest of the last 2 run(s) of any kind|jobs this workflow releases per run: 2|"
+# Under workflow_run the kind is the triggering run's event. The guard admits
+# only a fork's pull_request, so no branch is read: the fork controls it.
+ck "workflow_run: the triggering run's event, no branch" \
+   "$(EVENT=workflow_run RUN_ID=50 REF_NAME=main WF_REF="o/r/.github/workflows/fork-pr-runners.yml@refs/heads/main" \
+      DEMAND_RUN_ID=3 DEMAND_PATH=.github/workflows/ci.yml DEMAND_EVENT=pull_request sized)" \
+   "event=pull_request|history: largest of 1 pull_request run(s)|jobs this workflow releases per run: 6|"
+ck "workflow_run: not even for a push" \
+   "$(EVENT=workflow_run RUN_ID=50 REF_NAME=main WF_REF="o/r/.github/workflows/fork-pr-runners.yml@refs/heads/main" \
+      DEMAND_RUN_ID=3 DEMAND_PATH=.github/workflows/ci.yml DEMAND_EVENT=push sized)" \
+   "event=push|history: largest of 5 push run(s)|jobs this workflow releases per run: 30|"
+# An event that is not a GitHub word is not sent as a query field.
+ck "an odd event is not sent" \
+   "$(EVENT=workflow_run RUN_ID=50 WF_REF="o/r/.github/workflows/fork-pr-runners.yml@refs/heads/main" \
+      DEMAND_RUN_ID=3 DEMAND_PATH=.github/workflows/ci.yml DEMAND_EVENT='push&branch=x' sized)" \
+   "any|history: largest of the last 7 run(s) of any kind|jobs this workflow releases per run: 30|"
+# A refused kind listing is not followed by the fallback, which the same 403 or
+# rate limit would refuse, and whose answer would hide the refusal.
+ck "a refused kind listing does not fall back" \
+   "$(EVENT=pull_request HIST_FAIL=1 sized; grep -c '^::warning::could not read this workflow.s history' "$sc_tmp/log")" \
+   "event=pull_request|jobs this workflow releases per run: 0|1"
+ck "a refused fallback listing says so" \
+   "$(EVENT=schedule HIST_FAIL_ANY=1 sized; grep -c '^::warning::could not read this workflow.s history' "$sc_tmp/log")" \
+   "event=schedule;any|jobs this workflow releases per run: 0|1"
 # "0 because nothing has completed" and "0 because the listing was refused"
 # print the same line, and the second is a regression hiding as the first.
 ck "a refused history listing says so" \
    "$(: > "$sc_tmp/out"
       PATH="$sc_tmp/bin:$PATH" HIST_FAIL=1 GITHUB_REPOSITORY=o/r GITHUB_OUTPUT="$sc_tmp/out" LABEL=cuda \
-      GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" \
+      GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" GITHUB_EVENT_NAME=push GITHUB_REF_NAME=main \
       QUEUED_RUNS="" RUNNING_RUNS="" \
       bash "$sc_tmp/queue.sh" 2>&1 | grep -c "::warning::could not read this workflow.s history")" "1"
 # A listing that fails -- 403 without actions:read, a rate limit mid-burst --
@@ -945,7 +1045,7 @@ ck "a refused history listing says so" \
 # red run AND no box, where writing nothing gets it the floor of one box and a
 # warning naming the permission -- the degradation the count is allowed to have.
 qfail() { PATH="$sc_tmp/bin:$PATH" GH_FAIL=1 GITHUB_REPOSITORY=o/r GITHUB_OUTPUT="$sc_tmp/out" LABEL=cuda \
-          GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" \
+          GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" GITHUB_EVENT_NAME=push GITHUB_REF_NAME=main \
           bash "$sc_tmp/queue.sh" 2>&1; }
 # The demand already measured survives the failure. `own` is often the whole of
 # this run's need, and discarding it for one flaky listing hands a deep queue
@@ -953,7 +1053,7 @@ qfail() { PATH="$sc_tmp/bin:$PATH" GH_FAIL=1 GITHUB_REPOSITORY=o/r GITHUB_OUTPUT
 ck "a failed listing keeps the demand already measured" \
    "$( : > "$sc_tmp/out"
        PATH="$sc_tmp/bin:$PATH" RUNS_FAIL=1 GITHUB_REPOSITORY=o/r GITHUB_OUTPUT="$sc_tmp/out" LABEL=cuda \
-       GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" \
+       GITHUB_RUN_ID=3 GITHUB_WORKFLOW_REF="o/r/.github/workflows/ci.yml@refs/heads/main" GITHUB_EVENT_NAME=push GITHUB_REF_NAME=main \
        PREV_RUNS="9 8" JOBS_9="completed:self-hosted,cuda failure:self-hosted,cuda" JOBS_8="completed:ubuntu-latest" \
        bash "$sc_tmp/queue.sh" >/dev/null 2>&1; sed -n 's/^queued=//p' "$sc_tmp/out")" "2"
 ck "and names the permission it wanted" \
