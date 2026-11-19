@@ -65,7 +65,8 @@
 #
 # The caller needs one such job per label its fleet jobs use. The guard here
 # also admits a `workflow_run` only for a fork's pull_request run that is in
-# progress, and the run is sized from the triggering workflow's history.
+# progress, and the run is sized from the triggering workflow's history of
+# pull_request runs.
 #
 # Approval is what admits a fork's code to the fleet, so the caller must set
 # fork-PR approval to all outside contributors (`all_external_contributors`).
@@ -90,12 +91,21 @@
 #   want = min( busy + max(1, ceil(queued / jobs-per-box)), fleet size )
 #
 # `queued` is this repository's demand for the label: the jobs this run is about
-# to release, taken from what this workflow released on recent runs, plus the
-# jobs already queued by its OTHER runs. The run's own jobs are not in the API
-# while this step runs -- they carry `needs:` on it, so GitHub has not created
-# them -- so counting the queue alone returns 0 for the caller that is asking,
-# every time. GITHUB_TOKEN cannot see another repository's runs either way, so
-# this term is necessarily per-repo.
+# to release, taken from what this workflow released on recent runs of the same
+# kind, plus the jobs already queued by its OTHER runs. The run's own jobs are
+# not in the API while this step runs -- they carry `needs:` on it, so GitHub
+# has not created them -- so counting the queue alone returns 0 for the caller
+# that is asking, every time. GITHUB_TOKEN cannot see another repository's runs
+# either way, so this term is necessarily per-repo.
+#
+# The same kind is the same event and, for a push, the same branch class: the
+# branch, or every branch sharing its first segment when it has a `/`
+# (release/v4.13 and release/v4.14), looked for up to 500 pushes back. A
+# workflow releases a different set of jobs per kind, so a pull request is sized
+# from pull requests and a release push from release pushes. With no such run
+# on record that released a label job, the run is sized from the largest of the
+# last 20 runs of any kind. A sibling run of this workflow, still behind its own
+# start job, is credited with what a run of its own kind releases.
 #
 # `busy` is every box in the fleet that is already running someone's job --
 # ONE org-wide call, whatever the number of repositories. It is what makes the
@@ -329,6 +339,7 @@ jobs:
           # Set only under `workflow_run`: the run whose demand this is.
           DEMAND_RUN_ID: ${{ github.event.workflow_run.id }}
           DEMAND_PATH: ${{ github.event.workflow_run.path }}
+          DEMAND_EVENT: ${{ github.event.workflow_run.event }}
         run: |
           set -euo pipefail
           # THIS run's own jobs are not in the API yet, and that is not a race:
@@ -344,8 +355,9 @@ jobs:
           # layout hid it -- the overflow callers ran with `needs:` on the
           # primary, so by the time they counted, the jobs were real.
           #
-          # So this run's own demand is taken from the last completed run of the
-          # same workflow, and the API is asked only about the OTHER runs.
+          # So this run's own demand is taken from completed runs of the same
+          # workflow and the same kind, and the API is asked only about the
+          # OTHER runs.
           own=0
           ref="${GITHUB_WORKFLOW_REF:-}"         # owner/repo/.github/workflows/x.yml@ref
           # %%@*, not %@*: the shortest-suffix form cuts at the LAST @, and a
@@ -356,10 +368,16 @@ jobs:
           # one run's demand. A workflow path cannot contain @.
           wf_path="${ref#*/}"; wf_path="${wf_path#*/}"; wf_path="${wf_path%%@*}"
           demand_run="${GITHUB_RUN_ID:-}"
+          # The kind of run being sized: its event, and for a push its branch.
+          event="${GITHUB_EVENT_NAME:-}"
+          branch="${GITHUB_REF_NAME:-}"
           # Under `workflow_run`, GITHUB_WORKFLOW_REF names the companion, whose
           # runs hold no label jobs. The demand is the triggering run's. Its path
           # comes from a fork, so anything but a plain workflow file is dropped
-          # rather than built into an API URL, and the floor applies.
+          # rather than built into an API URL, and the floor applies. Its kind
+          # is its own event, which the guard admits only as pull_request. A
+          # pull_request kind takes no branch, so the fork's branch name is
+          # never read.
           if [ "${GITHUB_EVENT_NAME:-}" = "workflow_run" ]; then
             demand_run="${DEMAND_RUN_ID:-}"
             if [[ "${DEMAND_PATH:-}" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]]; then
@@ -367,40 +385,181 @@ jobs:
             else
               wf_path=""
             fi
+            event="${DEMAND_EVENT:-}"
+            branch=""
           fi
           wf="${wf_path##*/}"
-          if [ -n "${wf}" ]; then
-            # SEVERAL completed runs and the largest, not the newest one. A run
-            # cancelled while its start job was still going -- a second push to
-            # the same branch, or someone hitting cancel -- has only the
-            # ubuntu-latest start job on record, and so does a fork PR in a
-            # caller without a companion, where the guard skips the start job
-            # and everything gated behind it.
-            # Reading just the newest would report 0 for those and fall back to
-            # the floor: the same silent undersizing this replaces, arrived at
-            # by a different route.
-            #
-            # A fork run awaiting approval is listed as completed, conclusion
-            # `action_required`, with no jobs at all. Those are dropped before
-            # the five are taken, or a burst of unapproved fork PRs would fill
-            # the window with zeros.
-            if hist=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=completed&per_page=20" \
-                        --jq '.workflow_runs[] | "\(.id) \(.conclusion)"' 2>/dev/null); then
-              hist=$(awk '$2 != "action_required" { print $1 }' <<<"${hist}" | head -n 5)
-              for r in ${hist}; do
-                # Job records, not queue: every job the run created that carried
-                # the label, whatever it concluded. A matrix is counted by its
-                # legs rather than by the one entry that spawned them, which
-                # reading the workflow file could not do.
-                k=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${r}/jobs?per_page=100" --jq '.jobs[]' 2>/dev/null \
-                    | jq --arg l "${LABEL}" -s '[.[] | select(.labels | index($l))] | length') || k=0
-                [ "${k}" -gt "${own}" ] && own="${k}"
-              done
+          # An event name is a GitHub word. Anything else is not sent as a
+          # query, and the run is sized from runs of any kind.
+          [[ "${event}" =~ ^[a-z_]+$ ]] || event=""
+
+          # A workflow releases a different set of jobs per kind of run: a
+          # caller can gate its release-only jobs on the event or the branch,
+          # so a pull request releases fewer than a push to staging, and that
+          # fewer than a release run. Sized from runs of every kind, a release
+          # run after a few staging pushes gets a staging push's count, and
+          # the next five pull requests after it get the release run's.
+          #
+          # So the history is runs of the same event. A push also matches its
+          # branch class: the branch itself, or for a branch with a `/`, every
+          # branch with the same first segment, so release/v4.14 is sized from
+          # release/v4.13. Any other event matches on the event alone. A
+          # pull request's head branch is a different name every time, and a
+          # manual dispatch is mostly a one-off branch whose jobs follow from
+          # the event, not the branch. A pull request is not matched on its
+          # base branch either: the API leaves that out for a fork's run, and
+          # for a closed pull request's.
+
+          # Label jobs per history run id, each read once: the fallback and
+          # the estimates for sibling runs below reuse what is already read.
+          declare -A jobs_of=()
+          # Demand per kind, once each: "count<TAB>how".
+          declare -A demand_of=()
+          # Set once a listing is refused. Whatever refused it -- a 403, a
+          # rate limit -- refuses the next call too, so nothing more is asked.
+          refused=0
+
+          # Completed runs of this workflow as "id conclusion head_branch",
+          # newest first. $1 is the page size; the rest are extra query
+          # fields, which gh encodes.
+          completed_runs() {
+            local n="$1"; shift
+            gh api -X GET "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs" \
+                -f status=completed -f "per_page=${n}" "$@" \
+                --jq '.workflow_runs[] | "\(.id) \(.conclusion) \(.head_branch)"' 2>/dev/null
+          }
+          # Sets k to the label jobs run $1 created. Job records, not queue:
+          # every job the run created that carried the label, whatever it
+          # concluded. A matrix is counted by its legs rather than by the one
+          # entry that spawned them, which reading the workflow file could not
+          # do. A refused listing is named, not read as 0.
+          label_jobs() {
+            if [ -n "${jobs_of[$1]+x}" ]; then k="${jobs_of[$1]}"; return 0; fi
+            if ! k=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/$1/jobs?per_page=100" --jq '.jobs[]' 2>/dev/null </dev/null \
+                     | jq --arg l "${LABEL}" -s '[.[] | select(.labels | index($l))] | length'); then
+              echo "::warning::could not list the jobs of run $1; sizing ${LABEL} from the runs read before it" >&2
+              refused=1
+              return 1
+            fi
+            jobs_of[$1]="${k}"
+          }
+          # The largest count of label jobs in the listing on stdin, over at
+          # most $2 runs whose head branch starts with $3, until $1 of them
+          # released a label job. Sets `best`, `used` (runs that released
+          # one) and `read_n` (runs read).
+          #
+          # SEVERAL runs and the largest, not the newest one, and a run that
+          # released no label job does not count toward the $1. A run
+          # cancelled while its start job was still going -- a second push to
+          # the same branch, or someone hitting cancel -- has only the
+          # ubuntu-latest start job on record, and so does a fork PR in a
+          # caller without a companion, where the guard skips the start job and
+          # everything gated behind it. Those say nothing about what a run of
+          # this kind releases, and a burst of them would otherwise fill the
+          # window and send the run to the floor, or to the fallback.
+          #
+          # A fork run awaiting approval is listed as completed, conclusion
+          # `action_required`, with no jobs at all. Those are skipped without
+          # reading them.
+          largest() {
+            local r c b k
+            best=0; used=0; read_n=0
+            while read -r r c b; do
+              [ "${used}" -lt "$1" ] && [ "${read_n}" -lt "$2" ] || break
+              [ -n "${r}" ] && [ "${c}" != action_required ] || continue
+              case "${b}" in "$3"*) ;; *) continue ;; esac
+              read_n=$((read_n + 1))
+              label_jobs "${r}" || break
+              [ "${k}" -gt 0 ] || continue
+              used=$((used + 1))
+              [ "${k}" -gt "${best}" ] && best="${k}"
+            done
+            return 0
+          }
+          # What a run of event $1 on branch $2 releases. Sets `d_own` and
+          # `d_how`.
+          demand() {
+            local ev="$1" br="$2" pfx="" kind runs page more n
+            local -a q=()
+            [[ "${ev}" =~ ^[a-z_]+$ ]] || ev=""
+            kind="${ev}"
+            if [ "${ev}" = push ] && [ -n "${br}" ]; then
+              case "${br}" in
+                # A class wider than one branch is matched here, against
+                # every push run: the API matches a branch only exactly.
+                */*) pfx="${br%%/*}/"; kind="push on ${pfx}*" ;;
+                # One branch, which the API filters on itself.
+                *) q=(-f "branch=${br}"); kind="push on ${br}" ;;
+              esac
+            fi
+            if [ -n "${demand_of[${kind:-none}]+x}" ]; then
+              IFS=$'\t' read -r d_own d_how <<<"${demand_of[${kind:-none}]}"
+              return 0
+            fi
+            best=0; used=0
+            if [ -n "${ev}" ] && [ "${refused}" = 0 ]; then
+              if [ -z "${pfx}" ]; then
+                runs=$(completed_runs 20 -f "event=${ev}" ${q[@]+"${q[@]}"}) || { runs=""; refused=1; }
+              else
+                # A wide class is rare among pushes -- a release branch among
+                # pushes to staging -- so the listing pages further back
+                # until it holds ten, up to five pages.
+                runs=""; page=1
+                while :; do
+                  # A refused page leaves the runs listed before it.
+                  more=$(completed_runs 100 -f "event=${ev}" -f "page=${page}") || { refused=1; break; }
+                  runs="${runs}${more}"$'\n'
+                  n=$(P="${pfx}" awk 'NF && index($3, ENVIRON["P"]) == 1' <<<"${runs}" | wc -l)
+                  if [ "${n}" -ge 10 ] || [ "$(awk NF <<<"${more}" | wc -l)" -lt 100 ] || [ "${page}" -ge 5 ]; then
+                    break
+                  fi
+                  page=$((page + 1))
+                done
+              fi
+              largest 5 10 "${pfx}" <<<"${runs}"
+            fi
+            if [ "${best}" -gt 0 ]; then
+              d_own="${best}"; d_how="largest of ${used} ${kind} run(s)"
+            elif [ "${refused}" = 1 ]; then
+              # Zeros from refused calls are not history, and the fallback's
+              # calls would be refused too.
+              d_own=0; d_how="refused"
             else
+              # No run of this kind on record that released a label job, and
+              # calling this workflow says this one will. The runs a kind
+              # misses are the rare ones -- a release run among pull requests
+              # and staging pushes -- and those are the largest, so the
+              # fallback reads a wider window than the kind does and takes the
+              # largest of it, zeros and all. A tag push lands here: each tag
+              # is a new name.
+              if [ -z "${demand_of[any-kind]+x}" ]; then
+                runs=$(completed_runs 20) || { runs=""; refused=1; }
+                largest 20 20 "" <<<"${runs}"
+                if [ "${refused}" = 0 ] || [ "${best}" -gt 0 ]; then
+                  demand_of[any-kind]="${best}"$'\t'"largest of the last ${read_n} run(s) of any kind"
+                fi
+              fi
+              if [ -n "${demand_of[any-kind]+x}" ]; then
+                IFS=$'\t' read -r d_own d_how <<<"${demand_of[any-kind]}"
+                d_how="${kind:+no ${kind} run released a ${LABEL} job; }${d_how}"
+              else
+                d_own=0; d_how="refused"
+              fi
+            fi
+            [ "${d_how}" = refused ] || demand_of[${kind:-none}]="${d_own}"$'\t'"${d_how}"
+            return 0
+          }
+
+          if [ -n "${wf}" ]; then
+            demand "${event}" "${branch}"
+            own="${d_own}"
+            if [ "${d_how}" = refused ]; then
               # Named, because "0" from a rate-limited listing and "0" from a
               # workflow that has never completed a run print the same line --
               # and the first is a regression hiding as the second.
               echo "::warning::could not read this workflow's history; sizing ${LABEL} without it" >&2
+            else
+              echo "${LABEL} history: ${d_how}"
             fi
           fi
           echo "${LABEL} jobs this workflow releases per run: ${own}"
@@ -420,22 +579,23 @@ jobs:
           # Both listings are gathered before any are counted, then deduplicated
           # by run id: a run that is `queued` during the first call and
           # `in_progress` during the second appears in both, and would otherwise
-          # be counted twice -- including a full `own` worth, for a sibling run
+          # be counted twice -- including a full run's worth, for a sibling run
           # of this workflow.
           seen=""
           for status in queued in_progress; do
             # Captured first: a failing command in a `for` word list is invisible
             # to set -e, and a 403 (the caller did not grant actions:read) or a
             # rate limit would otherwise read as an empty queue.
-            runs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs?status=${status}&per_page=100" --jq '.workflow_runs[] | "\(.id) \(.path)"') \
+            runs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs?status=${status}&per_page=100" \
+                     --jq '.workflow_runs[] | "\(.id) \(.event) \(.head_branch // "-") \(.path)"') \
               || bail "could not list ${status} runs; does the caller grant actions: read?"
             seen="${seen}${seen:+$'\n'}${runs}"
           done
           others=0
-          while read -r run path; do
+          while read -r run sev sbr path; do
             [ -n "${run}" ] || continue
             [ "${run}" = "${demand_run}" ] && continue
-            jobs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs?per_page=100" --jq '.jobs[]') \
+            jobs=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs?per_page=100" --jq '.jobs[]' </dev/null) \
               || bail "could not list the jobs of run ${run}"
             k=$(jq --arg l "${LABEL}" -s '[.[] | select(.status == "queued" and (.labels | index($l)))] | length' <<<"${jobs}")
             if [ "${k}" -eq 0 ] && [ "${path}" = "${wf_path}" ]; then
@@ -446,7 +606,18 @@ jobs:
               # landing together is the case the fleet most needs to absorb,
               # and without this each run sizes for its own demand alone and
               # both ask for the same two boxes.
-              [ "${any}" -eq 0 ] && k="${own}"
+              #
+              # It is credited with what a run of ITS kind releases: a pull
+              # request beside a release push credits it with the release
+              # push's count, not its own. Once per kind, from the runs already
+              # read where they overlap. A sibling's branch reaches only a gh
+              # query field and a prefix test, and only for a push.
+              if [ "${any}" -eq 0 ]; then
+                demand "${sev}" "${sbr}"
+                k="${d_own}"
+                # Unreadable: this run's own demand, as the closest guess.
+                [ "${d_how}" != refused ] || k="${own}"
+              fi
             fi
             others=$((others + k))
           done <<<"$(printf '%s\n' "${seen}" | awk 'NF && !dup[$1]++')"
