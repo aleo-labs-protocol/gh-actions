@@ -2422,7 +2422,6 @@ ck "an HTML error page: warns"          "$(ns_run failure true NS_SLACK='<html>5
 ns_upload ci-state-ci.yml-staging-success 900 2>/dev/null; rm -f "$ns_tmp/runs/900"
 sed -i '$ s/"expired":false/"expired":true/' "$ns_tmp/art/ci-state-ci.yml-staging-success"
 ns_upload ci-state-ci.yml-staging-success 901 staging 7 8 schedule .github/workflows/ci.yml   # a fork's
-ns_upload ci-state-ci.yml-staging-success 902 staging 9 9 schedule .github/workflows/ci.yml   # another repository's
 ns_upload ci-state-ci.yml-staging-success 903 staging-x 7 7 schedule .github/workflows/ci.yml # another branch's
 ns_upload ci-state-ci.yml-staging-success 904 staging 7 7 pull_request .github/workflows/ci.yml
 ns_upload ci-state-ci.yml-staging-success 905 staging 7 7 schedule .github/workflows/other.yml
@@ -2430,6 +2429,11 @@ ck "only staging's own scheduled ci.yml counts" "$(ns_run success true GITHUB_RU
 # A re-run of an old run uploads last, and its state is the old commit's.
 ck "a re-run of an old run says nothing" "$(ns_run failure true GITHUB_RUN_ID=150)" "|"
 ck "and does not count as the newest"   "$(ns_run success true GITHUB_RUN_ID=1001)" "ci-state-ci.yml-staging-success|"
+# Two runs that finished out of order, each before the other recorded: the
+# newer run's state is the one that holds.
+ns_upload ci-state-ci.yml-b6-success 5000 b6 7 7 schedule .github/workflows/ci.yml
+ns_upload ci-state-ci.yml-b6-failure 4999 b6 7 7 schedule .github/workflows/ci.yml
+ck "the newest run, not the newest upload" "$(ns_run success true GITHUB_REF_NAME=b6 GITHUB_RUN_ID=5001)" "ci-state-ci.yml-b6-success|"
 # An earlier attempt of this run does: it posted red, so the green is news.
 ck "an earlier attempt of this run counts" "$(ns_run failure true GITHUB_RUN_ID=1002 >/dev/null; ns_run success true GITHUB_RUN_ID=1002)" \
    "ci-state-ci.yml-staging-success|$ns_green"

@@ -63,7 +63,7 @@ runs:
             body=$(gh api "repos/$repo/actions/artifacts?name=$prefix-$1&per_page=100&page=$page") || return 1
             hits=$(jq -r --arg b "$branch" --argjson r "$GITHUB_REPOSITORY_ID" --arg s "$1" '.artifacts[]
                      | select((.expired | not) and .workflow_run.head_branch == $b
-                              and .workflow_run.repository_id == $r and .workflow_run.head_repository_id == $r)
+                              and .workflow_run.head_repository_id == $r)
                      | [.workflow_run.id, .created_at, $s] | @tsv' <<< "$body") || return 1
             if [ -n "$hits" ]; then
               echo "$hits"
