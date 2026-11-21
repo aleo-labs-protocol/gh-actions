@@ -469,9 +469,13 @@ nothing.
   `failure`, records and posts nothing. A run the guard skipped or someone
   cancelled says nothing about the branch.
 - The state is an artifact named
-  `ci-state-<workflow file>-<branch>-<success|failure>`, kept 90 days, one for
-  each workflow file and branch. The newest unexpired one of the two is the
-  previous state. With none, a red run posts and a green one does not.
+  `ci-state-<workflow file>-<branch>-<success|failure>`, kept 90 days. It
+  counts only when the run that uploaded it is this repository's, not a
+  fork's, of the same branch, workflow file and event. Any run can upload an
+  artifact of any name.
+- The previous state is the one from the newest run, not the newest upload.
+  A run older than that, such as a re-run of an old run, records and posts
+  nothing. With no previous state, a red run posts and a green one does not.
 - The state is recorded before the post. When Slack refuses the post, the
   action warns and the next run does not repeat it. When the upload fails, the
   job fails and the next run posts the change.
