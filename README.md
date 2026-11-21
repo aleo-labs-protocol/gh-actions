@@ -478,12 +478,17 @@ nothing.
 - `github.token` reads the artifacts and the run's jobs, so the job needs
   `actions: read`. The Slack token is a bot token with `chat:write`, and the
   bot must be in the channel.
+- Keep the Slack token in a repository environment, such as `ci-notify`,
+  whose deployment branch policy admits only the scheduled branch, and set
+  `environment:` on the job. A repository or organization secret reaches a
+  workflow on any branch, so anyone who can push a branch could read it.
 
 ```yaml
   notify:
     if: always() && github.event_name == 'schedule'
     needs: [guard, test, lint]  # every job in the run
     runs-on: ubuntu-latest
+    environment: ci-notify  # holds CI_SLACK_TOKEN; admits only staging
     permissions: { actions: read }
     steps:
       - uses: aleo-labs-protocol/gh-actions/.github/actions/notify-ci-state@v2
