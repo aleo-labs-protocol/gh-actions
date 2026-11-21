@@ -10,7 +10,10 @@ description: Post to Slack when a scheduled run's state changes from green to re
 
 inputs:
   slack-token:
-    description: A Slack bot token with chat:write. The bot must be in the channel.
+    description: >-
+      A Slack bot token with chat:write. The bot must be in the channel. Keep it
+      in an environment that admits only the scheduled branch: a repository or
+      organization secret reaches a workflow on any branch.
     required: true
   channel:
     description: The Slack channel to post to, such as '#ci' or a channel ID.
@@ -42,35 +45,85 @@ runs:
         fi
         repo=$GITHUB_REPOSITORY
         branch=$GITHUB_REF_NAME
-        wf=${GITHUB_WORKFLOW_REF%%@*}
-        wf=${wf##*/}
-        # An artifact name cannot hold a / or a :.
+        path=${GITHUB_WORKFLOW_REF%%@*}
+        path=${path#"$repo"/}
+        wf=${path##*/}
+        # An artifact name cannot hold a / or a :. Two branches can map to one
+        # name, so the branch is checked again on the way back in.
         prefix="ci-state-${wf//[^A-Za-z0-9._-]/-}-${branch//[^A-Za-z0-9._-]/-}"
 
-        # The newest unexpired state of either name. An earlier attempt of this
-        # run counts: it is newer than any other, and a re-run that goes green
-        # after one that posted red should say so.
-        if ! prev=$(for s in success failure; do
-                      gh api --paginate "repos/$repo/actions/artifacts?name=$prefix-$s&per_page=100" \
-                        --jq ".artifacts[] | select(.expired | not) | [.created_at, \"$s\"] | @tsv"
-                    done | sort -r | head -1 | cut -f2); then
+        # Any run can upload an artifact of any name, a fork's pull request
+        # included. A state counts only from this repository's own run of this
+        # branch, and then only from this workflow on this event. Prints
+        # "run id, created_at, state" for each. The listing is newest first, so
+        # it is read only up to the first page that has one.
+        candidates() { # state
+          local page=1 body hits
+          while :; do
+            body=$(gh api "repos/$repo/actions/artifacts?name=$prefix-$1&per_page=100&page=$page") || return 1
+            hits=$(jq -r --arg b "$branch" --argjson r "$GITHUB_REPOSITORY_ID" --arg s "$1" '.artifacts[]
+                     | select((.expired | not) and .workflow_run.head_branch == $b
+                              and .workflow_run.head_repository_id == $r)
+                     | [.workflow_run.id, .created_at, $s] | @tsv' <<< "$body") || return 1
+            if [ -n "$hits" ]; then
+              echo "$hits"
+              return 0
+            fi
+            [ "$(jq '.artifacts | length' <<< "$body")" = 100 ] || return 0
+            page=$((page + 1))
+          done
+        }
+        all=
+        unknown=
+        for s in success failure; do
+          if c=$(candidates "$s"); then all+="$c"$'\n'; else unknown=1; fi
+        done
+        # The newest RUN, not the newest upload: re-running an old run uploads
+        # late, and its state is still the old commit's. An earlier attempt of
+        # this run counts, so a re-run that goes green after one that posted
+        # red says so.
+        sorted=$(sed '/^$/d' <<< "$all" | sort -t $'\t' -k1,1nr -k2,2r)
+        prev=
+        tries=0
+        while [ -z "$unknown" ] && IFS=$'\t' read -r id _ s; do
+          run=$(gh api "repos/$repo/actions/runs/$id" --jq '[.event, .path] | @tsv') || { unknown=1; break; }
+          if [ "$run" = "$GITHUB_EVENT_NAME"$'\t'"$path" ]; then
+            if [ "$id" -gt "$GITHUB_RUN_ID" ]; then
+              echo "Run $id is newer and has recorded $s. This run is older: nothing to record."
+              exit 0
+            fi
+            prev=$s
+            break
+          fi
+          tries=$((tries + 1))
+          [ "$tries" -lt 5 ] || break
+        done <<< "$sorted"
+        if [ -n "$unknown" ]; then
           echo "::warning::Could not read the previous state of $prefix; treating it as unknown."
           prev=
         fi
         echo "Previous state: ${prev:-none}. This run: $RESULT."
 
+        # Slack reads &, < and > as markup.
+        esc() { local s=${1//&/"&amp;"}; s=${s//</"&lt;"}; printf '%s' "${s//>/"&gt;"}"; }
         url="$GITHUB_SERVER_URL/$repo/actions/runs/$GITHUB_RUN_ID"
-        at="$repo $branch is"
+        at="$repo $(esc "$branch") is"
         sha=${GITHUB_SHA:0:9}
         text=
         if [ "$RESULT" = failure ] && [ "$prev" != failure ]; then
           # The jobs that failed in the latest attempt of each. This job is
           # still running, so its conclusion is not failure.
-          jobs=$(gh api --paginate "repos/$repo/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
-                   --jq '.jobs[] | select(.conclusion == "failure") | .name') || jobs=
-          failed=$(head -5 <<< "$jobs" | sed '/^$/d' | paste -sd, - | sed 's/,/, /g')
-          n=$(sed '/^$/d' <<< "$jobs" | wc -l)
-          [ "$n" -le 5 ] || failed="$failed and $((n - 5)) more"
+          if ! jobs=$(gh api --paginate "repos/$repo/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+                        --jq '.jobs[] | select(.conclusion == "failure") | .name'); then
+            echo "::warning::Could not list the run's jobs."
+            jobs=
+          fi
+          mapfile -t names < <(sed '/^$/d' <<< "$jobs")
+          failed=
+          for j in "${names[@]:0:5}"; do
+            failed+="${failed:+, }$(esc "$j")"
+          done
+          [ "${#names[@]}" -le 5 ] || failed+=" and $((${#names[@]} - 5)) more"
           text=":red_circle: $at red at $sha: ${failed:-see the run} $url"
         elif [ "$RESULT" = success ] && [ "$prev" = failure ]; then
           text=":large_green_circle: $at green again at $sha $url"
