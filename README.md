@@ -4,8 +4,9 @@ The reusable workflows and composite actions that aleo-labs-protocol
 repositories share: starting and running on the self-hosted runner fleet, and
 merging branches forward (`merge-branches.yml`), mirroring branches into
 another repository (`mirror-branches.yml`), bumping crates that have
-security advisories (`bump-advisories.yml`), and bumping a pin to another
-repository's branch (`bump-pr`). The fleet itself — the boxes,
+security advisories (`bump-advisories.yml`), bumping a pin to another
+repository's branch (`bump-pr`), and telling Slack when a scheduled run turns
+red or green (`notify-ci-state`). The fleet itself — the boxes,
 their provisioning and the AWS role `start-runner.yml` assumes — is managed
 elsewhere.
 
@@ -455,6 +456,42 @@ fails when it finds that token.
             Cargo.toml
             Cargo.lock
           upstreams: owner/upstream refs/upstream/staging  # optional
+```
+
+## Telling Slack when CI turns red
+
+The `notify-ci-state` action posts to Slack when a scheduled run's state
+changes: once when the branch turns red, with the jobs that failed, and once
+when it is green again. A pass, or a failure that was already red, posts
+nothing.
+
+- A run that is not `checked`, or whose `result` is not `success` or
+  `failure`, records and posts nothing. A run the guard skipped or someone
+  cancelled says nothing about the branch.
+- The state is an artifact named
+  `ci-state-<workflow file>-<branch>-<success|failure>`, kept 90 days, one for
+  each workflow file and branch. The newest unexpired one of the two is the
+  previous state. With none, a red run posts and a green one does not.
+- The state is recorded before the post. When Slack refuses the post, the
+  action warns and the next run does not repeat it. When the upload fails, the
+  job fails and the next run posts the change.
+- `github.token` reads the artifacts and the run's jobs, so the job needs
+  `actions: read`. The Slack token is a bot token with `chat:write`, and the
+  bot must be in the channel.
+
+```yaml
+  notify:
+    if: always() && github.event_name == 'schedule'
+    needs: [guard, test, lint]  # every job in the run
+    runs-on: ubuntu-latest
+    permissions: { actions: read }
+    steps:
+      - uses: aleo-labs-protocol/gh-actions/.github/actions/notify-ci-state@v2
+        with:
+          slack-token: ${{ secrets.CI_SLACK_TOKEN }}
+          channel: ${{ vars.CI_SLACK_CHANNEL || '#ci' }}
+          result: ${{ contains(needs.*.result, 'failure') && 'failure' || contains(needs.*.result, 'cancelled') && 'cancelled' || 'success' }}
+          checked: ${{ needs.guard.outputs.checked }}  # 'true' when this run ran the tests
 ```
 
 ## Versioning

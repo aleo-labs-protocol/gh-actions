@@ -255,7 +255,7 @@ on = d.get('on', d.get(True))
 i = on['workflow_call']['inputs']
 print('yes' if i.get('role-to-assume', {}).get('required') else 'no')
 " 2>/dev/null)" "yes"
-for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-refs bump-pr; do
+for a in gpu-runner-preflight gpu-runner-report runner-job-setup check-shared-refs bump-pr notify-ci-state; do
   ck "$a action exists" "$([[ -f "$REPO/.github/actions/$a/action.yml" ]] && echo yes || echo no)" "yes"
   ck "$a is composite"  "$(grep -c 'using: composite' "$REPO/.github/actions/$a/action.yml")" "1"
 done
@@ -2302,6 +2302,129 @@ ck "an unknown upstream rev fails"   "$(bp_run "$bp_latest" UPSTREAMS='o/u nope'
 
 unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
 rm -rf "$bp_tmp"
+
+echo "== notify-ci-state: Slack hears a change, not a pass =="
+ns_tmp="$(mktemp -d)"; mkdir -p "$ns_tmp/bin" "$ns_tmp/art"
+python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/actions/notify-ci-state/action.yml'))
+st = {x['name']: x for x in d['runs']['steps']}
+open('$ns_tmp/decide.sh', 'w').write(st['Compare with the last checked run']['run'])
+open('$ns_tmp/post.sh', 'w').write(st['Post to Slack']['run'])
+"
+# An artifact name is a file in art/ with one JSON object per upload;
+# NS_GH_FAIL fails the listing, and jobs.json is the run's jobs.
+cat > "$ns_tmp/bin/gh" <<'GHEOF'
+#!/bin/bash
+[ "${GH_TOKEN:-}" = gh-tok ] || { echo "gh without github.token: gh $*" >&2; exit 1; }
+jq_arg() { local prev=; for a in "$@"; do [ "$prev" = --jq ] && { echo "$a"; return; }; prev=$a; done; }
+case "$*" in
+  "api --paginate repos/o/r/actions/artifacts?name="*"&per_page=100 "*)
+    [ -z "${NS_GH_FAIL:-}" ] || { echo "HTTP 403" >&2; exit 1; }
+    n=${3#*name=}; n=${n%%&*}
+    cat "$NS_TMP/art/$n" 2>/dev/null | jq -s '{artifacts: .}' | jq -r "$(jq_arg "$@")";;
+  "api --paginate repos/o/r/actions/runs/42/jobs?filter=latest&per_page=100 "*)
+    jq -r "$(jq_arg "$@")" "$NS_TMP/jobs.json";;
+  *) echo "unexpected: gh $*" >&2; exit 1;;
+esac
+GHEOF
+# Slack: the headers come from stdin and the payload from a file. NS_SLACK is
+# the answer, NS_CURL_RC curl's exit code.
+cat > "$ns_tmp/bin/curl" <<'CURLEOF'
+#!/bin/bash
+echo "$*" >> "$NS_TMP/curl.argv"
+cat >> "$NS_TMP/curl.headers"
+prev=; for a in "$@"; do [ "$prev" = --data-binary ] && jq -r .channel,.text "${a#@}" >> "$NS_TMP/posts"; prev=$a; done
+[ "${NS_CURL_RC:-0}" = 0 ] || { echo "curl: (6) Could not resolve host" >&2; exit "$NS_CURL_RC"; }
+echo "${NS_SLACK:-{\"ok\":true\}}"
+CURLEOF
+chmod +x "$ns_tmp/bin/gh" "$ns_tmp/bin/curl"
+# The run's jobs: one passed, this one still running, and $@ failed.
+ns_jobs() { printf '%s\n' "$@" | sed '/^$/d' | jq -R '{name: ., conclusion: "failure"}' \
+  | jq -s '{jobs: ([{name: "build", conclusion: "success"}, {name: "notify", conclusion: null}] + .)}' > "$ns_tmp/jobs.json"; }
+ns_jobs
+# One run of the action: decide; upload, as the record step would when it is
+# asked to; post, when there is text. -> "<the artifact recorded>|<the post>"
+ns_run() { # result checked [env assignments]
+  local result=$1 checked=$2; shift 2
+  rm -rf "$ns_tmp/runner"; mkdir "$ns_tmp/runner"; : > "$ns_tmp/output"; : > "$ns_tmp/posts"
+  env PATH="$ns_tmp/bin:$PATH" NS_TMP="$ns_tmp" GH_TOKEN=gh-tok RESULT="$result" CHECKED="$checked" \
+    GITHUB_REPOSITORY=o/r GITHUB_REF_NAME=staging GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/staging \
+    GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=42 GITHUB_SHA=0123456789abcdef \
+    RUNNER_TEMP="$ns_tmp/runner" GITHUB_OUTPUT="$ns_tmp/output" "$@" bash "$ns_tmp/decide.sh" > "$ns_tmp/out" 2>&1
+  local rc=$? art text n
+  art=$(sed -n 's/^artifact=//p' "$ns_tmp/output"); text=$(sed -n 's/^text=//p' "$ns_tmp/output")
+  if [ -n "$art" ]; then
+    # A clock in a file: each ns_run is a subshell.
+    echo >> "$ns_tmp/clock"; n=$(wc -l < "$ns_tmp/clock")
+    [ "$(cat "$(sed -n 's/^path=//p' "$ns_tmp/output")")" = "${art##*-}" ] || art="$art(the file disagrees)"
+    printf '{"created_at": "2026-11-21T%02d:%02d:00Z", "expired": false}\n' $((n / 60)) $((n % 60)) >> "$ns_tmp/art/$art"
+  fi
+  if [ -n "$text" ]; then
+    env PATH="$ns_tmp/bin:$PATH" NS_TMP="$ns_tmp" SLACK_TOKEN=xoxb-SECRET CHANNEL='#ci' TEXT="$text" \
+      RUNNER_TEMP="$ns_tmp/runner" "$@" bash "$ns_tmp/post.sh" >> "$ns_tmp/out" 2>&1 || rc="post exited $?"
+  fi
+  [ "$rc" = 0 ] || art="rc=$rc $art"
+  echo "$art|$(tr '\n' ' ' < "$ns_tmp/posts")"
+}
+ns_url=https://github.com/o/r/actions/runs/42
+ns_red="#ci :red_circle: o/r staging is red at 012345678: test (a), lint $ns_url "
+ns_green="#ci :large_green_circle: o/r staging is green again at 012345678 $ns_url "
+ck "first run green: records, no post"  "$(ns_run success true)" "ci-state-ci.yml-staging-success|"
+ns_jobs "test (a)" lint
+ck "green -> red: posts the failed jobs" "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|$ns_red"
+ck "red -> red: silent"                 "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|"
+# A skipped or cancelled run says nothing about the branch.
+ck "cancelled: records nothing"         "$(ns_run cancelled true)" "|"
+ck "unchecked green: records nothing"   "$(ns_run success false)" "|"
+ck "no checked at all: records nothing" "$(ns_run success '')" "|"
+ck "red -> green: posts green"          "$(ns_run success true)" "ci-state-ci.yml-staging-success|$ns_green"
+ck "green -> green: silent"             "$(ns_run success true)" "ci-state-ci.yml-staging-success|"
+ck "unchecked red: records nothing"     "$(ns_run failure false)" "|"
+ck "and the next green is not news"     "$(ns_run success true)" "ci-state-ci.yml-staging-success|"
+ck "the token is never printed"         "$(grep -c SECRET "$ns_tmp/out")" "0"
+ck "nor on curl's command line"         "$(grep -c SECRET "$ns_tmp/curl.argv")" "0"
+ck "it is a header, on stdin"           "$(grep -cxF 'Authorization: Bearer xoxb-SECRET' "$ns_tmp/curl.headers")" "2"
+# A refusal is a warning, and the state is still recorded: the next red run
+# does not post the same red again.
+ck "Slack refuses: records and posted"  "$(ns_run failure true NS_SLACK='{"ok":false,"error":"not_in_channel"}')" \
+   "ci-state-ci.yml-staging-failure|$ns_red"
+ck "and warns with Slack's reason"      "$(grep -c '^::warning::Slack did not take the message (not_in_channel)' "$ns_tmp/out")" "1"
+ck "and the next red is silent"         "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|"
+ck "Slack unreachable: warns, exit 0"   "$(ns_run success true NS_CURL_RC=6)$(grep -c '^::warning::Slack did not' "$ns_tmp/out")" \
+   "ci-state-ci.yml-staging-success|${ns_green}1"
+ck "an HTML error page: warns"          "$(ns_run failure true NS_SLACK='<html>502</html>')$(grep -c '^::warning::Slack did not' "$ns_tmp/out")" \
+   "ci-state-ci.yml-staging-failure|${ns_red}1"
+# The newest state wins, whichever name it is under, and an expired one is gone.
+printf '{"created_at": "2026-12-31T00:00:00Z", "expired": true}\n' >> "$ns_tmp/art/ci-state-ci.yml-staging-success"
+ck "an expired state does not count"    "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|"
+ns_jobs j1 j2 j3 j4 j5 j6 j7
+ck "a long list is cut, a / is a -"     "$(ns_run failure true GITHUB_REF_NAME=feat/x)" \
+   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r feat/x is red at 012345678: j1, j2, j3, j4, j5 and 2 more $ns_url "
+ns_jobs
+ck "no failed job found: the run alone" "$(ns_run failure true GITHUB_REF_NAME=b2)" \
+   "ci-state-ci.yml-b2-failure|#ci :red_circle: o/r b2 is red at 012345678: see the run $ns_url "
+# A listing that fails warns: it is not the same as having no state.
+ck "no listing: green says nothing"     "$(ns_run success true GITHUB_REF_NAME=b3 NS_GH_FAIL=1)$(grep -c '^::warning::Could not read' "$ns_tmp/out")" \
+   "ci-state-ci.yml-b3-success|1"
+ck "no listing: red posts"              "$(ns_run failure true GITHUB_REF_NAME=b3 NS_GH_FAIL=1)" \
+   "ci-state-ci.yml-b3-failure|#ci :red_circle: o/r b3 is red at 012345678: see the run $ns_url "
+ck "first run red: posts"               "$(ns_run failure true GITHUB_REF_NAME=b4)" \
+   "ci-state-ci.yml-b4-failure|#ci :red_circle: o/r b4 is red at 012345678: see the run $ns_url "
+ck "another workflow has its own state" "$(ns_run success true GITHUB_REF_NAME=b4 GITHUB_WORKFLOW_REF=o/r/.github/workflows/nightly.yml@refs/heads/b4)" \
+   "ci-state-nightly.yml-b4-success|"
+# The record step, which ns_run stands in for. It comes before the post, so a
+# failed upload fails the job before Slack hears anything; overwrite lets a
+# re-run of the job upload the name again.
+ck "the record step"                    "$(python3 -c "
+import yaml
+d = yaml.safe_load(open('$REPO/.github/actions/notify-ci-state/action.yml'))
+s = d['runs']['steps']
+r = [i for i, x in enumerate(s) if x.get('uses', '').startswith('actions/upload-artifact@')]
+w = s[r[0]]['with']
+print(r, s[r[0]]['if'], w['name'], w['path'], w['retention-days'], w['overwrite'], s[2]['if'], sorted(d['inputs']))
+")" "[1] steps.decide.outputs.artifact != '' \${{ steps.decide.outputs.artifact }} \${{ steps.decide.outputs.path }} 90 True steps.decide.outputs.text != '' ['channel', 'checked', 'result', 'slack-token']"
+rm -rf "$ns_tmp"
 
 rm -rf "$no_aws"
 echo
