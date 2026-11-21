@@ -1,0 +1,122 @@
+# Tells Slack when a scheduled run turns a branch red, and once when it is green
+# again. An ordinary pass, or a failure that was already red, says nothing.
+#
+# Call it from a last job that needs every other job, with
+# `if: always() && github.event_name == 'schedule'` and `actions: read`. The
+# state is an artifact per workflow file and branch whose NAME ends in the
+# state, so reading it is a listing, not a download.
+name: Notify CI state
+description: Post to Slack when a scheduled run's state changes from green to red or back, and record the state for the next run.
+
+inputs:
+  slack-token:
+    description: A Slack bot token with chat:write. The bot must be in the channel.
+    required: true
+  channel:
+    description: The Slack channel to post to, such as '#ci' or a channel ID.
+    required: true
+  result:
+    description: The run's result, success, failure or cancelled. Anything but success or failure records and posts nothing.
+    required: true
+  checked:
+    description: "'true' when this run ran the tests. Anything else records and posts nothing."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compare with the last checked run
+      id: decide
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RESULT: ${{ inputs.result }}
+        CHECKED: ${{ inputs.checked }}
+      run: |
+        set -euo pipefail
+        # A run the guard skipped or someone cancelled says nothing about the
+        # branch, and recording it would hide the next change.
+        if [ "$CHECKED" != true ] || { [ "$RESULT" != success ] && [ "$RESULT" != failure ]; }; then
+          echo "Not a checked run that passed or failed (checked=$CHECKED, result=$RESULT): nothing to record."
+          exit 0
+        fi
+        repo=$GITHUB_REPOSITORY
+        branch=$GITHUB_REF_NAME
+        wf=${GITHUB_WORKFLOW_REF%%@*}
+        wf=${wf##*/}
+        # An artifact name cannot hold a / or a :.
+        prefix="ci-state-${wf//[^A-Za-z0-9._-]/-}-${branch//[^A-Za-z0-9._-]/-}"
+
+        # The newest unexpired state of either name. An earlier attempt of this
+        # run counts: it is newer than any other, and a re-run that goes green
+        # after one that posted red should say so.
+        if ! prev=$(for s in success failure; do
+                      gh api --paginate "repos/$repo/actions/artifacts?name=$prefix-$s&per_page=100" \
+                        --jq ".artifacts[] | select(.expired | not) | [.created_at, \"$s\"] | @tsv"
+                    done | sort -r | head -1 | cut -f2); then
+          echo "::warning::Could not read the previous state of $prefix; treating it as unknown."
+          prev=
+        fi
+        echo "Previous state: ${prev:-none}. This run: $RESULT."
+
+        url="$GITHUB_SERVER_URL/$repo/actions/runs/$GITHUB_RUN_ID"
+        at="$repo $branch is"
+        sha=${GITHUB_SHA:0:9}
+        text=
+        if [ "$RESULT" = failure ] && [ "$prev" != failure ]; then
+          # The jobs that failed in the latest attempt of each. This job is
+          # still running, so its conclusion is not failure.
+          jobs=$(gh api --paginate "repos/$repo/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+                   --jq '.jobs[] | select(.conclusion == "failure") | .name') || jobs=
+          failed=$(head -5 <<< "$jobs" | sed '/^$/d' | paste -sd, - | sed 's/,/, /g')
+          n=$(sed '/^$/d' <<< "$jobs" | wc -l)
+          [ "$n" -le 5 ] || failed="$failed and $((n - 5)) more"
+          text=":red_circle: $at red at $sha: ${failed:-see the run} $url"
+        elif [ "$RESULT" = success ] && [ "$prev" = failure ]; then
+          text=":large_green_circle: $at green again at $sha $url"
+        fi
+
+        mkdir -p "$RUNNER_TEMP/ci-state"
+        echo "$RESULT" > "$RUNNER_TEMP/ci-state/state"
+        {
+          echo "artifact=$prefix-$RESULT"
+          echo "path=$RUNNER_TEMP/ci-state/state"
+          echo "text=$text"
+        } >> "$GITHUB_OUTPUT"
+
+    # Before the post: a failed upload fails the job, and the next run posts
+    # the change late rather than twice. A failed post leaves the state
+    # recorded, so the next run does not repeat it.
+    - name: Record the state
+      if: steps.decide.outputs.artifact != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.decide.outputs.artifact }}
+        path: ${{ steps.decide.outputs.path }}
+        retention-days: 90
+        overwrite: true
+        if-no-files-found: error
+
+    - name: Post to Slack
+      if: steps.decide.outputs.text != ''
+      shell: bash
+      env:
+        SLACK_TOKEN: ${{ inputs.slack-token }}
+        CHANNEL: ${{ inputs.channel }}
+        TEXT: ${{ steps.decide.outputs.text }}
+      run: |
+        set -uo pipefail
+        echo "$TEXT"
+        payload="$RUNNER_TEMP/ci-state/payload.json"
+        jq -n --arg channel "$CHANNEL" --arg text "$TEXT" '{channel: $channel, text: $text}' > "$payload"
+        # The token goes in on stdin, so it is on no command line.
+        resp=$(printf 'Authorization: Bearer %s\n' "$SLACK_TOKEN" |
+                 curl -sS --max-time 30 -H @- -H 'Content-Type: application/json; charset=utf-8' \
+                   --data-binary @"$payload" https://slack.com/api/chat.postMessage 2>&1)
+        rc=$?
+        # Slack answers HTTP 200 with ok: false for a refusal, such as a bot
+        # that is not in the channel.
+        if [ "$rc" != 0 ] || [ "$(jq -r '.ok' <<< "$resp" 2> /dev/null)" != true ]; then
+          err=$(jq -r '.error // empty' <<< "$resp" 2> /dev/null) || err=
+          echo "::warning::Slack did not take the message (${err:-curl exit $rc: ${resp:0:200}}). The state is recorded, so the next run will not repeat it."
+        fi
