@@ -2370,7 +2370,7 @@ ns_run() { # result checked [env assignments]
   for a in "$@"; do [[ $a == GITHUB_RUN_ID=* ]] && id=${a#*=}; done
   env PATH="$ns_tmp/bin:$PATH" NS_TMP="$ns_tmp" GH_TOKEN=gh-tok RESULT="$result" CHECKED="$checked" \
     GITHUB_REPOSITORY=o/r GITHUB_REPOSITORY_ID=7 GITHUB_REF_NAME=staging GITHUB_EVENT_NAME=schedule \
-    GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/staging \
+    GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/staging GITHUB_WORKFLOW=CI \
     GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID="$id" GITHUB_SHA=0123456789abcdef \
     RUNNER_TEMP="$ns_tmp/runner" GITHUB_OUTPUT="$ns_tmp/output" "$@" bash "$ns_tmp/decide.sh" > "$ns_tmp/out" 2>&1
   local rc=$? art text
@@ -2390,8 +2390,8 @@ ns_run() { # result checked [env assignments]
   [ "$rc" = 0 ] || art="rc=$rc $art"
   echo "$art|$(sed -E 's#https://github.com/o/r/actions/runs/[0-9]+#<run>#' "$ns_tmp/posts" | tr '\n' ' ')"
 }
-ns_red="#ci :red_circle: o/r staging is red at 012345678: test (a), lint <run> "
-ns_green="#ci :large_green_circle: o/r staging is green again at 012345678 <run> "
+ns_red="#ci :red_circle: o/r \`CI\` on staging is red at 012345678: test (a), lint <run> "
+ns_green="#ci :large_green_circle: o/r \`CI\` on staging is green again at 012345678 <run> "
 ck "first run green: records, no post"  "$(ns_run success true)" "ci-state-ci.yml-staging-success|"
 ns_jobs "test (a)" lint
 ck "green -> red: posts the failed jobs" "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|$ns_red"
@@ -2439,18 +2439,18 @@ ck "an earlier attempt of this run counts" "$(ns_run failure true GITHUB_RUN_ID=
    "ci-state-ci.yml-staging-success|$ns_green"
 ns_jobs j1 j2 j3 j4 j5 j6 j7
 ck "a long list is cut, a / is a -"     "$(ns_run failure true GITHUB_REF_NAME=feat/x)" \
-   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r feat/x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
+   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r \`CI\` on feat/x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
 # feat-x shares feat/x's artifact name, not its state.
 ck "a branch with the same name is not the same" "$(ns_run failure true GITHUB_REF_NAME=feat-x)" \
-   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r feat-x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
+   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r \`CI\` on feat-x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
 ns_jobs "test (ubuntu-latest, stable)" "a&b<c>"
 ck "a comma in a job name is kept, markup escaped" "$(ns_run failure true GITHUB_REF_NAME='x<y>')" \
-   "ci-state-ci.yml-x-y--failure|#ci :red_circle: o/r x&lt;y&gt; is red at 012345678: test (ubuntu-latest, stable), a&amp;b&lt;c&gt; <run> "
+   "ci-state-ci.yml-x-y--failure|#ci :red_circle: o/r \`CI\` on x&lt;y&gt; is red at 012345678: test (ubuntu-latest, stable), a&amp;b&lt;c&gt; <run> "
 ns_jobs
 ck "no failed job found: the run alone" "$(ns_run failure true GITHUB_REF_NAME=b2)" \
-   "ci-state-ci.yml-b2-failure|#ci :red_circle: o/r b2 is red at 012345678: see the run <run> "
+   "ci-state-ci.yml-b2-failure|#ci :red_circle: o/r \`CI\` on b2 is red at 012345678: see the run <run> "
 ck "jobs not listed: the run, and warns" "$(ns_run failure true GITHUB_REF_NAME=b2a NS_JOBS_FAIL=1)$(grep -c "^::warning::Could not list the run's jobs" "$ns_tmp/out")" \
-   "ci-state-ci.yml-b2a-failure|#ci :red_circle: o/r b2a is red at 012345678: see the run <run> 1"
+   "ci-state-ci.yml-b2a-failure|#ci :red_circle: o/r \`CI\` on b2a is red at 012345678: see the run <run> 1"
 # A listing that fails warns: it is not the same as having no state. Either
 # listing: the first one's failure is not hidden by the second's success.
 ns_run failure true GITHUB_REF_NAME=b3 >/dev/null
@@ -2459,19 +2459,30 @@ for f in success failure; do
      "ci-state-ci.yml-b3-success|1"
 done
 ck "no run lookup: red posts"           "$(ns_run failure true GITHUB_REF_NAME=b3 NS_RUN_FAIL=1)$(grep -c '^::warning::Could not read' "$ns_tmp/out")" \
-   "ci-state-ci.yml-b3-failure|#ci :red_circle: o/r b3 is red at 012345678: see the run <run> 1"
+   "ci-state-ci.yml-b3-failure|#ci :red_circle: o/r \`CI\` on b3 is red at 012345678: see the run <run> 1"
 ck "first run red: posts"               "$(ns_run failure true GITHUB_REF_NAME=b4)" \
-   "ci-state-ci.yml-b4-failure|#ci :red_circle: o/r b4 is red at 012345678: see the run <run> "
+   "ci-state-ci.yml-b4-failure|#ci :red_circle: o/r \`CI\` on b4 is red at 012345678: see the run <run> "
 ck "another workflow has its own state" "$(ns_run success true GITHUB_REF_NAME=b4 GITHUB_WORKFLOW_REF=o/r/.github/workflows/nightly.yml@refs/heads/b4)" \
    "ci-state-nightly.yml-b4-success|"
+# Two workflows on one branch, each red in turn: each message names its own,
+# and the green one's recovery says nothing of the other.
+ns_ci=(GITHUB_REF_NAME=b7 GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/b7 GITHUB_WORKFLOW=CI)
+ns_ba=(GITHUB_REF_NAME=b7 GITHUB_WORKFLOW_REF=o/r/.github/workflows/bump-advisories.yml@refs/heads/b7 GITHUB_WORKFLOW='Bump `crates` & advisories')
+ck "two workflows: CI's red names CI"   "$(ns_run failure true "${ns_ci[@]}")" \
+   "ci-state-ci.yml-b7-failure|#ci :red_circle: o/r \`CI\` on b7 is red at 012345678: see the run <run> "
+ck "the other's red names it, escaped"  "$(ns_run failure true "${ns_ba[@]}")" \
+   "ci-state-bump-advisories.yml-b7-failure|#ci :red_circle: o/r \`Bump 'crates' &amp; advisories\` on b7 is red at 012345678: see the run <run> "
+ck "its green names it alone"           "$(ns_run success true "${ns_ba[@]}")" \
+   "ci-state-bump-advisories.yml-b7-success|#ci :large_green_circle: o/r \`Bump 'crates' &amp; advisories\` on b7 is green again at 012345678 <run> "
+ck "and CI is still red"                "$(ns_run failure true "${ns_ci[@]}")" "ci-state-ci.yml-b7-failure|"
 # Ninety days of runs: the newest page is enough, and a page with none of
 # this branch's leads to the next.
 for i in $(seq 1 150); do ns_upload ci-state-ci.yml-b5-success "$i" b5 7 7 schedule .github/workflows/ci.yml; done
 ck "one page when it has the state"     "$(ns_run failure true GITHUB_REF_NAME=b5 GITHUB_RUN_ID=2000)$(tr '\n' ' ' < "$ns_tmp/listed")" \
-   "ci-state-ci.yml-b5-failure|#ci :red_circle: o/r b5 is red at 012345678: see the run <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-failure 1 "
+   "ci-state-ci.yml-b5-failure|#ci :red_circle: o/r \`CI\` on b5 is red at 012345678: see the run <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-failure 1 "
 for i in $(seq 1 100); do ns_upload ci-state-ci.yml-b5-success "$((3000 + i))" b5-other 7 7 schedule .github/workflows/ci.yml; done
 ck "the next page when it has not"      "$(ns_run success true GITHUB_REF_NAME=b5 GITHUB_RUN_ID=4000)$(tr '\n' ' ' < "$ns_tmp/listed")" \
-   "ci-state-ci.yml-b5-success|#ci :large_green_circle: o/r b5 is green again at 012345678 <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-success 2 ci-state-ci.yml-b5-failure 1 "
+   "ci-state-ci.yml-b5-success|#ci :large_green_circle: o/r \`CI\` on b5 is green again at 012345678 <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-success 2 ci-state-ci.yml-b5-failure 1 "
 # The record step, which ns_run stands in for. It comes before the post, so a
 # failed upload fails the job before Slack hears anything; overwrite lets a
 # re-run of the job upload the name again.

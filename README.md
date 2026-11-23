@@ -465,6 +465,9 @@ changes: once when the branch turns red, with the jobs that failed, and once
 when it is green again. A pass, or a failure that was already red, posts
 nothing.
 
+- Each message names the repository, the workflow's `name:` and the branch,
+  such as ``o/r `CI` on staging is red``. Each workflow file has its own state,
+  so one workflow's green says nothing about another's red.
 - A run that is not `checked`, or whose `result` is not `success` or
   `failure`, records and posts nothing. A run the guard skipped or someone
   cancelled says nothing about the branch.
