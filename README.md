@@ -378,6 +378,13 @@ requests need not gate on advisories published after they were opened.
   and titled for the target. It comments when an advisory is added and closes the issue when none are left.
   The fix is a raised requirement in a `Cargo.toml`, or an ignore with a
   reason in `deny.toml`.
+- It tries each network operation up to three times: the cargo-deny download
+  10 s apart, and the toolchain, `cargo fetch`, `cargo update`, the advisory
+  database, and GitHub reads, pushes and edits 10 s and then 30 s apart. The checks run
+  offline once the crates and the database are fetched, so a check that
+  reports advisories runs once. A write that adds a pull request, an issue, a
+  comment or a close is made once, so a lost answer cannot make it twice; its
+  failure fails the run.
 
 It pushes and writes as the merge-bot App, in the `merge-bot` environment, set
 up as under [Merging branches](#merging-branches). The caller owns the schedule:
