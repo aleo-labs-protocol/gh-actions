@@ -45,24 +45,54 @@ jobs:
           VERSION: ${{ inputs.cargo-deny }}
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$VERSION/cargo-deny-$VERSION-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP" --strip-components=1 --wildcards '*/cargo-deny'
+          # Runs a command up to three times, 10 s and then 30 s apart, and
+          # returns its last status. cargo and rustup retry for a few seconds
+          # on their own; this outlasts a longer outage. Only for a command
+          # that is safe to repeat, and not for a shell function: set -e does
+          # not apply inside a command that `retry` runs.
+          retry() {
+            local delay
+            for delay in 10 30; do
+              "$@" && return 0
+              echo "::warning::${*:1:4} exited $?; trying again in $delay s" >&2
+              sleep "$delay"
+            done
+            "$@"
+          }
+          # To a file: curl starts a retried transfer again from the first
+          # byte, which a pipe into tar cannot take back.
+          curl -fsSL --retry 2 --retry-all-errors --retry-delay 10 -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$VERSION/cargo-deny-$VERSION-x86_64-unknown-linux-musl.tar.gz"
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP" --strip-components=1 --wildcards '*/cargo-deny'
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          rustup toolchain install --profile minimal
+          retry rustup toolchain install --profile minimal
 
       # Runs before the app token exists.
       - name: Update the crates with advisories
         id: bump
         run: |
           set -euo pipefail
+          # Runs a command up to three times, 10 s and then 30 s apart, and
+          # returns its last status. cargo and rustup retry for a few seconds
+          # on their own; this outlasts a longer outage. Only for a command
+          # that is safe to repeat, and not for a shell function: set -e does
+          # not apply inside a command that `retry` runs.
+          retry() {
+            local delay
+            for delay in 10 30; do
+              "$@" && return 0
+              echo "::warning::${*:1:4} exited $?; trying again in $delay s" >&2
+              sleep "$delay"
+            done
+            "$@"
+          }
           dir="$RUNNER_TEMP/bump-advisories"
           mkdir -p "$dir"
           # One line per error: advisory, crate, version, the crates that
           # depend on it, title.
-          findings() { # file, then cargo-deny options
+          findings() { # file
             local out=$1 rc=0
-            shift
-            cargo deny "$@" --format json check advisories 2> "$dir/deny.json" > /dev/null || rc=$?
+            cargo deny --offline --format json check advisories 2> "$dir/deny.json" > /dev/null || rc=$?
             jq -Rr 'fromjson? | select(.type == "diagnostic" and .fields.severity == "error") | .fields as $f
                     | ($f.graphs[0] // {}) as $g
                     | [$f.advisory.id // $f.code, $g.Krate.name // "", $g.Krate.version // "",
@@ -280,21 +310,26 @@ jobs:
             # An earlier update may have moved it.
             cargo pkgid "$1" > /dev/null 2>&1 || return 0
             cp Cargo.lock "$dir/Cargo.lock"
-            cargo update -p "$1"
+            retry cargo update -p "$1"
             # An updated crate is not downloaded yet, and --offline cannot fetch it.
-            cargo fetch
+            retry cargo fetch
             if ! python3 "$dir/lock.py" repair "$dir/Cargo.lock"; then
               echo "::warning::lock.py repair failed after cargo update -p $1, so $1 stays as it was"
               cp "$dir/Cargo.lock" Cargo.lock
               return 0
             fi
-            findings next --offline
+            findings next
             if [ "$(wc -l < "$dir/next")" -lt "$(wc -l < "$dir/after")" ]; then
               mv "$dir/next" "$dir/after"
             else
               cp "$dir/Cargo.lock" Cargo.lock
             fi
           }
+          # What `cargo deny check advisories` would fetch: the crates and the
+          # advisory database. Every check then runs offline, so a check that
+          # reports advisories is never repeated.
+          retry cargo fetch
+          retry cargo deny fetch db
           findings before
           cp "$dir/before" "$dir/after"
           # The crate itself, then the crates that depend on what is left.
@@ -326,6 +361,25 @@ jobs:
           CHANGED: ${{ steps.bump.outputs.changed }}
         run: |
           set -euo pipefail
+          # Runs a command up to three times, 10 s and then 30 s apart, and
+          # returns its last status. cargo and rustup retry for a few seconds
+          # on their own; this outlasts a longer outage. Only for a command
+          # that is safe to repeat, and not for a shell function: set -e does
+          # not apply inside a command that `retry` runs.
+          retry() {
+            local delay
+            for delay in 10 30; do
+              "$@" && return 0
+              echo "::warning::${*:1:4} exited $?; trying again in $delay s" >&2
+              sleep "$delay"
+            done
+            "$@"
+          }
+          # Reads, and writes that set something to a value, are retried. A
+          # write that adds something, such as a pull request, an issue, a
+          # comment or a close with its comment, is not: GitHub can carry it
+          # out and still fail the request, and a second attempt would add it
+          # again. Its failure fails the run.
           dir="$RUNNER_TEMP/bump-advisories"
           label=cargo-advisories
           title="cargo deny advisories on $TARGET"
@@ -354,22 +408,26 @@ jobs:
           unneeded="\`$TARGET\` no longer needs this update."
 
           # --head matches a fork's branch of the same name too.
-          pr=$(gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
+          pr=$(retry gh pr list --head "$BRANCH" --base "$TARGET" --state open --json number,isCrossRepository \
                  --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
           # The workflow pushes one commit of its own. A tip that someone else
           # wrote or committed hands the branch to them: the workflow neither
-          # force-pushes over it nor closes it.
+          # force-pushes over it nor closes it. A tip it cannot read fails the
+          # run: set -e does not apply where theirs is a condition.
           theirs() {
-            [ -n "$(BOT=$bot gh api "repos/$REPO/commits/$BRANCH" \
-                      --jq 'select(.author.login != env.BOT or .committer.login != env.BOT) | .sha')" ]
+            local tip
+            tip=$(BOT=$bot retry gh api "repos/$REPO/commits/$BRANCH" \
+                    --jq 'select(.author.login != env.BOT or .committer.login != env.BOT) | .sha') || exit 1
+            [ -n "$tip" ]
           }
           # Comments once per result, not once per run. The marker names the
           # Cargo.lock this run computed, or `none` when the target needs none.
           comment_once() { # marker, body
             local marker="<!-- bump-advisories: $1 -->" bodies
             # Not piped: grep -q exits at the first match, and under pipefail
-            # gh's SIGPIPE would read as no match.
-            bodies=$(gh api "repos/$REPO/issues/$pr/comments" --paginate --jq '.[].body')
+            # gh's SIGPIPE would read as no match. A failed attempt can leave
+            # the pages it read, and a body read twice matches the same.
+            bodies=$(retry gh api "repos/$REPO/issues/$pr/comments" --paginate --jq '.[].body')
             if grep -qxF -- "$marker" <<< "$bodies"; then
               echo "#$pr already has this comment"
             else
@@ -380,7 +438,10 @@ jobs:
           }
           if [ "$CHANGED" = true ]; then
             lock=$(git hash-object Cargo.lock)
-            if [ -n "$pr" ] && [ "$(gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)" = "$lock" ]; then
+            # Assigned, not compared in place, so a failed read fails the run.
+            held=
+            [ -z "$pr" ] || held=$(retry gh api "repos/$REPO/contents/Cargo.lock?ref=$BRANCH" --jq .sha)
+            if [ -n "$pr" ] && [ "$held" = "$lock" ]; then
               echo "#$pr already holds this Cargo.lock"
             elif [ -n "$pr" ] && theirs; then
               comment_once "$lock" "\`$TARGET\` now needs a different \`Cargo.lock\`. Someone else has pushed to this branch, so the workflow does not rebuild it. Close this pull request, and the next run rebuilds the branch and opens a new one.
@@ -394,17 +455,19 @@ jobs:
               helper='!f() { if [ "$1" = get ] && [ -n "${GH_TOKEN:-}" ]; then printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; fi; }; f'
               git config "credential.$GITHUB_SERVER_URL.helper" "$helper"
               git config user.name "$bot"
-              git config user.email "$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)+$bot@users.noreply.github.com"
+              # GitHub links the commit to the App by this id.
+              id=$(retry gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)
+              git config user.email "$id+$bot@users.noreply.github.com"
               subject="Bump crates with security advisories"
               git -c core.hooksPath=/dev/null checkout -B "$BRANCH"
               printf '%s\n\nFixes:\n%s\n' "$subject" "$fixed" | git -c core.hooksPath=/dev/null commit -F - -- Cargo.lock
               # Rebuilt from the target on every run that changes it.
-              git -c core.hooksPath=/dev/null push --force origin "HEAD:refs/heads/$BRANCH"
+              retry git -c core.hooksPath=/dev/null push --force origin "HEAD:refs/heads/$BRANCH"
               body="Updates \`Cargo.lock\` on \`$TARGET\` past these \`cargo deny check advisories\` findings:
 
           ${summary}Opened by [a run]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID) of the \`$GITHUB_WORKFLOW\` workflow. Each run that changes the result rebuilds this branch from \`$TARGET\` and force-pushes it. Once someone else pushes to the branch, the workflow comments instead."
               if [ -n "$pr" ]; then
-                gh pr edit "$pr" --body "$body"
+                retry gh pr edit "$pr" --body "$body"
               else
                 gh pr create --head "$BRANCH" --base "$TARGET" --title "$subject" --body "$body"
               fi
@@ -417,7 +480,7 @@ jobs:
             fi
           fi
 
-          issue=$(TITLE=$title gh issue list --label "$label" --state open --json number,title \
+          issue=$(TITLE=$title retry gh issue list --label "$label" --state open --json number,title \
                     --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')
           if [ -s "$dir/after" ]; then
             remaining=$(list "$dir/after")
@@ -426,13 +489,13 @@ jobs:
           $remaining
 
           The \`$GITHUB_WORKFLOW\` workflow keeps this list current and closes this issue when it is empty."
-            gh label create "$label" --force --color B60205 --description "cargo deny advisories that Cargo.lock updates cannot fix"
+            retry gh label create "$label" --force --color B60205 --description "cargo deny advisories that Cargo.lock updates cannot fix"
             if [ -z "$issue" ]; then
               gh issue create --title "$title" --label "$label" --body "$body"
             else
-              old=$(gh issue view "$issue" --json body --jq .body)
+              old=$(retry gh issue view "$issue" --json body --jq .body)
               if [ "$old" != "$body" ]; then
-                gh issue edit "$issue" --body "$body"
+                retry gh issue edit "$issue" --body "$body"
                 # An edit notifies nobody; a comment does. New means an
                 # advisory and crate the old list lacks.
                 # shellcheck disable=SC2016

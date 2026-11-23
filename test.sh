@@ -1635,7 +1635,7 @@ import os, re, sys, yaml
 wf, name, script = sys.argv[1:]
 d = yaml.safe_load(open(wf))
 st = next(x for x in d['jobs']['bump']['steps'] if x.get('name') == name)
-vals = {'github.repository': 'o/r', 'inputs.target': 'staging', 'steps.app.outputs.token': 'tok-SECRET',
+vals = {'github.repository': 'o/r', 'inputs.target': 'staging', 'inputs.cargo-deny': '0.20.2', 'steps.app.outputs.token': 'tok-SECRET',
         'steps.app.outputs.app-slug': 'merge-bot', 'steps.bump.outputs.changed': os.environ.get('BA_CHANGED', '')}
 def ref(m):
     r = m[1].strip()
@@ -1664,12 +1664,23 @@ ba_step() { # step name, env assignments -> its exit code
 # raises socket2 0.6.5 to 0.6.6 first. `cargo metadata` drops the source from
 # each entry, and moves BA_REJECT's edge to socket2 0.6.5 back to 0.5.10, as
 # cargo does to an edge outside its range. `cargo metadata --locked` rejects
-# any lockfile with BA_OFFLINE, as when a crate is missing offline.
+# any lockfile with BA_OFFLINE, as when a crate is missing offline. A check
+# runs only offline and only once `cargo deny fetch db` has fetched the
+# database, and each is counted in checks. `cargo deny fetch db` fails its
+# first BA_DB_FAILS calls, and `cargo update` its first BA_UPDATE_FAILS.
 cat > "$ba_tmp/bin/cargo" <<'CARGOEOF'
 #!/bin/bash
+fails() { # name, how many calls fail -> whether this call does
+  echo >> "$BA_TMP/tries.$1"
+  [ "$(wc -l < "$BA_TMP/tries.$1")" -le "${2:-0}" ] && echo "error: $1: network unreachable" >&2
+}
 case "$*" in
   "pkgid "*) ;;
+  "deny fetch db")
+    fails db "${BA_DB_FAILS:-}" && exit 1
+    touch "$BA_TMP/db";;
   "update -p "*)
+    fails update "${BA_UPDATE_FAILS:-}" && exit 1
     echo "$3" >> "$BA_LOG"
     n=${3%@*} v=${3#*@}
     sed -i "/^name = \"$n\"\$/,/^\$/s/^version = \"$v\"\$/version = \"${v%.*}.$(( ${v##*.} + 1 ))\"/" Cargo.lock
@@ -1687,10 +1698,12 @@ case "$*" in
     if [ -n "${BA_REJECT:-}" ]; then
       sed -i "/^name = \"$BA_REJECT\"\$/,/^\$/s/\"socket2 0.6.5\"/\"socket2 0.5.10\"/" Cargo.lock
     fi;;
-  "deny --format json check advisories"|"deny --offline --format json check advisories")
-    [ "$2" = --offline ] && [ -e "$BA_TMP/unfetched" ] \
+  "deny --offline --format json check advisories")
+    echo >> "$BA_TMP/checks"
+    [ -e "$BA_TMP/db" ] || { echo "error: the advisory database was not fetched" >&2; exit 1; }
+    [ -e "$BA_TMP/unfetched" ] \
       && { echo "error: failed to download \`$3\`: --offline was specified" >&2; exit 1; }
-    [ -n "${BA_BROKEN:-}" ] && { echo "error: failed to fetch the advisory database" >&2; exit 1; }
+    [ -n "${BA_BROKEN:-}" ] && { echo "error: failed to load the advisory database" >&2; exit 1; }
     echo '{"type":"log","fields":{"level":"INFO","message":"fetching"}}' >&2
     echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"not encountered"}}' >&2
     [ -n "${BA_CLEAN:-}" ] && exit 0
@@ -1708,9 +1721,12 @@ case "$*" in
   *) echo "unexpected: cargo $*" >&2; exit 1;;
 esac
 CARGOEOF
-chmod +x "$ba_tmp/bin/cargo"
+# Each wait, logged instead of waited.
+printf '#!/bin/sh\nprintf "%%s " "$1" >> %q\n' "$ba_tmp/sleeps" > "$ba_tmp/bin/sleep"
+chmod +x "$ba_tmp/bin/cargo" "$ba_tmp/bin/sleep"
 git init -q --bare "$ba_tmp/origin.git"
-printf '#!/bin/sh\necho push >> %q\n' "$ba_tmp/log" > "$ba_tmp/origin.git/hooks/pre-receive"
+# A push is logged, and refused once while push-fails exists.
+printf '#!/bin/sh\necho push >> %q\nrm %q 2>/dev/null && exit 1\nexit 0\n' "$ba_tmp/log" "$ba_tmp/push-fails" > "$ba_tmp/origin.git/hooks/pre-receive"
 chmod +x "$ba_tmp/origin.git/hooks/pre-receive"
 git init -q "$ba_tmp/seed"
 reg='source = "registry+https://github.com/rust-lang/crates.io-index"'
@@ -1791,12 +1807,13 @@ LOCKEOF
 git -C "$ba_tmp/seed" add Cargo.lock; git -C "$ba_tmp/seed" commit -q -m base
 git -C "$ba_tmp/seed" push -q "$ba_tmp/origin.git" staging
 ba_bump() { # env assignments -> the step's exit code
-  rm -rf "$ba_tmp/work" "$ba_tmp/runner" "$ba_tmp/unfetched"; mkdir "$ba_tmp/runner"
+  rm -rf "$ba_tmp/work" "$ba_tmp/runner" "$ba_tmp/unfetched" "$ba_tmp/db" "$ba_tmp"/tries.*; mkdir "$ba_tmp/runner"
   git clone -q --branch staging "$ba_tmp/origin.git" "$ba_tmp/work"
-  : > "$ba_tmp/log"; : > "$ba_tmp/outputs"; : > "$ba_tmp/out"
+  : > "$ba_tmp/log"; : > "$ba_tmp/outputs"; : > "$ba_tmp/out"; : > "$ba_tmp/checks"; : > "$ba_tmp/sleeps"
   ba_step "Update the crates with advisories" "$@"
   echo "$?"
 }
+ba_sleeps() { cat "$ba_tmp/sleeps"; }
 ba_ids() { cut -f1 "$ba_tmp/runner/bump-advisories/$1" | tr '\n' ' '; }
 ba_out() { tr '\n' '|' < "$ba_tmp/runner/bump-advisories/$1"; }
 ba_deps() { sed -n "/^name = \"$1\"\$/,/^\$/s/^ \"\(.*\)\",\$/\1/p" "${2:-$ba_tmp/work/Cargo.lock}" | tr '\n' '|'; }
@@ -1814,6 +1831,9 @@ ck "unfixable: the step succeeds"    "$(ba_bump BA_FIX=nothing)" "0"
 ck "unfixable: none fixed"           "$(ba_ids fixed)" ""
 ck "unfixable: all left"             "$(ba_ids after)" "$ba_all"
 ck "unfixable: Cargo.lock unchanged" "$(cat "$ba_tmp/outputs")" ""
+# Before, then after each of the two updates: a check that finds
+# advisories exits 1, and is not run again.
+ck "unfixable: each check runs once" "$(wc -l < "$ba_tmp/checks") $(ba_sleeps)" "3 "
 ck "mixed: the step succeeds"        "$(ba_bump BA_FIX=zip@8.6.0 BA_MIXED=1)" "0"
 ck "mixed: zip fixed"                "$(ba_ids fixed)" "$ba_all"
 ck "mixed: foo left"                 "$(ba_ids after)" "RUSTSEC-2026-0001 "
@@ -1844,6 +1864,17 @@ ck "cargo fails anyway: zip stays"   "$(git -C "$ba_tmp/work" diff --quiet -- Ca
 ck "cargo fails anyway: all left"    "$(ba_ids after)" "$ba_all"
 ck "broken cargo deny fails"         "$(ba_bump BA_BROKEN=1)" "1"
 ck "broken: nothing updated"         "$(cat "$ba_tmp/log")" ""
+ck "broken: checked once, no retry"  "$(wc -l < "$ba_tmp/checks") $(ba_sleeps)" "1 "
+# The network: the database's fetch and `cargo update` are tried three times.
+ck "db fails twice: the step succeeds" "$(ba_bump BA_FIX=nothing BA_DB_FAILS=2)" "0"
+ck "db fails twice: 10 s, then 30 s" "$(ba_sleeps)" "10 30 "
+ck "db fails twice: the same findings" "$(ba_ids after)" "$ba_all"
+ck "db fails twice: each check once" "$(wc -l < "$ba_tmp/checks")" "3"
+ck "db fails three times: fails"     "$(ba_bump BA_FIX=nothing BA_DB_FAILS=3)" "1"
+ck "db fails three times: no check"  "$(wc -l < "$ba_tmp/checks") $(ba_sleeps)$(cat "$ba_tmp/log")" "0 10 30 "
+ck "update fails once: succeeds"     "$(ba_bump BA_FIX=self_update@1.3.0 BA_UPDATE_FAILS=1)" "0"
+ck "update fails once: the same fix" "$(tr '\n' ' ' < "$ba_tmp/log")$(ba_ids fixed)$(ba_sleeps)" "zip@8.6.0 self_update@1.3.0 ${ba_all}10 "
+ck "update fails once: it says so"   "$(grep -c '^::warning::cargo update -p zip@8.6.0 exited 1; trying again in 10 s' "$ba_tmp/out")" "1"
 
 echo "== bump-advisories: the pull request and the issue =="
 # BA_PR and BA_ISSUE are the open pull request and issue, BA_SHA the blob the
@@ -1851,9 +1882,17 @@ echo "== bump-advisories: the pull request and the issue =="
 # branch's tip is the bot's commit, or one BA_HUMAN wrote or BA_COMMITTER
 # rewrote, when set; BA_COMMENTS is a file holding the pull request's one
 # comment. Writes are logged, and each --body is kept as body.<command>.
+# The first call that starts with BA_GH_FLAKY fails, and every call that
+# starts with BA_GH_DOWN. A write that is
+# BA_GH_LOST, such as "pr create", is done and then fails, as when GitHub
+# does it and the answer is lost.
 cat > "$ba_tmp/bin/gh" <<'GHEOF'
 #!/bin/bash
 [ "${GH_TOKEN:-}" = tok-SECRET ] || { echo "gh without the app token: gh $*" >&2; exit 1; }
+if [ -n "${BA_GH_FLAKY:-}" ] && [[ "$*" == "$BA_GH_FLAKY"* ]] && [ ! -e "$BA_TMP/flaked" ]; then
+  touch "$BA_TMP/flaked"; echo "HTTP 502: Bad Gateway" >&2; exit 1
+fi
+[ -z "${BA_GH_DOWN:-}" ] || [[ "$*" != "$BA_GH_DOWN"* ]] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
 jq_arg() { local prev=; for a in "$@"; do [ "$prev" = --jq ] && { echo "$a"; return; }; prev=$a; done; }
 case "$*" in
   "pr list --head ci/bump-advisories-into-staging --base staging "*)
@@ -1878,13 +1917,14 @@ case "$*" in
   "issue view"*) cat "$BA_OLD";;
   "pr create"*|"pr edit"*|"pr close"*|"pr comment"*|"label create"*|"issue create"*|"issue edit"*|"issue comment"*|"issue close"*)
     echo "gh $1 $2" >> "$BA_LOG"
-    prev=; for a in "$@"; do [ "$prev" = --body ] && printf '%s\n' "$a" > "$BA_TMP/body.$1-$2"; prev=$a; done;;
+    prev=; for a in "$@"; do [ "$prev" = --body ] && printf '%s\n' "$a" > "$BA_TMP/body.$1-$2"; prev=$a; done
+    [ "$1 $2" != "${BA_GH_LOST:-}" ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; };;
   *) echo "unexpected: gh $*" >&2; exit 1;;
 esac
 GHEOF
 chmod +x "$ba_tmp/bin/gh"
 ba_publish() { # env assignments -> the step's exit code
-  : > "$ba_tmp/log"; rm -f "$ba_tmp"/body.*
+  : > "$ba_tmp/log"; : > "$ba_tmp/sleeps"; rm -f "$ba_tmp"/body.* "$ba_tmp/flaked"
   BA_CHANGED="$(sed -n 's/^changed=//p' "$ba_tmp/outputs")" \
     ba_step "Open, update or close the pull request and the issue" "$@"
   echo "$?"
@@ -1901,12 +1941,12 @@ ck "fixed: the body names them"      "$(grep -c '^- \[RUSTSEC-2026-036[789]\](ht
 ck "fixed: so does the commit"       "$(git -C "$ba_tmp/origin.git" log -1 --format=%B ci/bump-advisories-into-staging | grep -c '^- \[RUSTSEC')" "3"
 # Each run starts from a fresh checkout, as on a runner.
 ba_fixed() { ba_bump BA_FIX=self_update@1.3.0 >/dev/null; git -C "$ba_tmp/work" hash-object Cargo.lock; }
+# The same, with the pull request's branch gone, so the push is not a no-op.
+ba_unpushed() { ba_fixed >/dev/null; git -C "$ba_tmp/origin.git" update-ref -d refs/heads/ci/bump-advisories-into-staging; }
 ck "same lock: does nothing"         "$(ba_publish BA_PR=5 BA_SHA="$(ba_fixed)")$(ba_log)" "0"
-ba_fixed >/dev/null
-git -C "$ba_tmp/origin.git" update-ref -d refs/heads/ci/bump-advisories-into-staging
+ba_unpushed
 ck "new lock: pushes, then edits"    "$(ba_publish BA_PR=5 BA_SHA=0123)$(ba_log)" "0push|gh pr edit|"
-ba_fixed >/dev/null
-git -C "$ba_tmp/origin.git" update-ref -d refs/heads/ci/bump-advisories-into-staging
+ba_unpushed
 ck "a fork's pull request is not ours" "$(ba_publish)$(ba_log)" "0push|gh pr create|"
 ba_fixed >/dev/null
 ck "a human's commit: comments instead" "$(ba_publish BA_PR=5 BA_SHA=0123 BA_HUMAN=alice)$(ba_log)" "0gh pr comment|"
@@ -1942,6 +1982,61 @@ ck "clean, a human's commit: open"   "$(ba_publish BA_PR=5 BA_HUMAN=alice)$(ba_l
 ck "clean: the comment says why"     "$(grep -c 'no longer needs this update' "$ba_tmp/body.pr-comment")" "1"
 cp "$ba_tmp/body.pr-comment" "$ba_tmp/comment"
 ck "clean, commented: nothing"       "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_COMMENTS="$ba_tmp/comment")$(ba_log)" "0"
+
+# Cases from above, with one call failing once. A read, a push, or a write
+# that sets a value is tried again, and the result is the same.
+ck "comments unread once: nothing"   "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_COMMENTS="$ba_tmp/comment" BA_GH_FLAKY='api repos/o/r/issues/5/comments')$(ba_log)$(ba_sleeps)" "010 "
+# Read as nobody's, the branch would be closed.
+ck "the tip unread once: still theirs" "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_GH_FLAKY='api repos/o/r/commits/')$(ba_log)$(ba_sleeps)" "0gh pr comment|10 "
+ba_fixed >/dev/null
+ck "pr list fails once: opens one"   "$(ba_publish BA_GH_FLAKY='pr list')$(ba_log)$(ba_sleeps)" "0push|gh pr create|10 "
+ba_unpushed; touch "$ba_tmp/push-fails"
+ck "a push refused once: pushes again" "$(ba_publish)$(ba_log)$(ba_sleeps)" "0push|push|gh pr create|10 "
+ck "the lock unread once: no change" "$(ba_publish BA_PR=5 BA_SHA="$(git -C "$ba_tmp/work" hash-object Cargo.lock)" BA_GH_FLAKY='api repos/o/r/contents/')$(ba_log)$(ba_sleeps)" "010 "
+ba_unpushed
+ck "an edit fails once: edits again" "$(ba_publish BA_PR=5 BA_SHA=0123 BA_GH_FLAKY='pr edit')$(ba_log)$(ba_sleeps)" "0push|gh pr edit|10 "
+# A write that adds something is done once, and its failure fails the run.
+ba_unpushed
+ck "pr create lost: not repeated"    "$(ba_publish BA_GH_LOST='pr create')$(ba_log)$(ba_sleeps)" "1push|gh pr create|"
+ck "pr comment lost: not repeated"   "$(ba_publish BA_PR=5 BA_SHA=0123 BA_HUMAN=alice BA_GH_LOST='pr comment')$(ba_log)$(ba_sleeps)" "1gh pr comment|"
+ba_bump BA_FIX=nothing >/dev/null
+grep -v 0369 "$ba_tmp/issue" > "$ba_tmp/old"
+for c in 'issue list' 'label create' 'issue view' 'issue edit'; do
+  ck "$c fails once: the same"       "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old" BA_GH_FLAKY="$c")$(ba_log)$(ba_sleeps)" "0gh label create|gh issue edit|gh issue comment|10 "
+done
+ck "issue comment lost: not repeated" "$(ba_publish BA_ISSUE=3 BA_OLD="$ba_tmp/old" BA_GH_LOST='issue comment')$(ba_log)$(ba_sleeps)" "1gh label create|gh issue edit|gh issue comment|"
+ck "issue create lost: not repeated" "$(ba_publish BA_GH_LOST='issue create')$(ba_log)$(ba_sleeps)" "1gh label create|gh issue create|"
+ck "pr close lost: not repeated"     "$(ba_publish BA_PR=5 BA_GH_LOST='pr close')$(ba_log)$(ba_sleeps)" "1gh pr close|"
+ba_bump BA_CLEAN=1 >/dev/null
+# A read that fails every time fails the run before it writes: neither an
+# empty tip, an empty lock nor an empty App id is taken as an answer.
+ck "the tip unreadable: fails, no close" "$(ba_publish BA_PR=5 BA_HUMAN=alice BA_GH_DOWN='api repos/o/r/commits/')$(ba_log)$(ba_sleeps)" "110 30 "
+ba_fixed >/dev/null
+ck "the tip unreadable: no push"     "$(ba_publish BA_PR=5 BA_SHA=0123 BA_HUMAN=alice BA_GH_DOWN='api repos/o/r/commits/')$(ba_log)" "1"
+ck "the lock unreadable: no push"    "$(ba_publish BA_PR=5 BA_GH_DOWN='api repos/o/r/contents/')$(ba_log)" "1"
+ck "the App id unreadable: no push"  "$(ba_publish BA_GH_DOWN='api users/')$(ba_log)" "1"
+ba_bump BA_CLEAN=1 >/dev/null
+ck "issue close lost: not repeated"  "$(ba_publish BA_ISSUE=3 BA_GH_LOST='issue close')$(ba_log)$(ba_sleeps)" "1gh issue close|"
+
+# `retry` itself: the same in each step that has one, and run here against a
+# command that fails its first $1 calls with exit 7.
+for st in "Install cargo-deny and the toolchain" "Update the crates with advisories" \
+          "Open, update or close the pull request and the issue"; do
+  python3 "$ba_tmp/step.py" "$REPO/.github/workflows/bump-advisories.yml" "$st" "$ba_tmp/step.sh" > /dev/null
+  sed -n '/^retry() {$/,/^}$/p' "$ba_tmp/step.sh" > "$ba_tmp/retry.${st%% *}"
+done
+ck "retry: the same in three steps" "$(for f in "$ba_tmp"/retry.*; do [ -s "$f" ] && cksum < "$f"; done | sort | uniq -c | awk '{ print $1 }')" "3"
+printf '#!/bin/sh\necho >> %q\n[ "$(wc -l < %q)" -gt "$1" ] || exit 7\n' "$ba_tmp/calls" "$ba_tmp/calls" > "$ba_tmp/bin/flaky"
+chmod +x "$ba_tmp/bin/flaky"
+ba_retry() { # failures -> the script's exit code, the calls, the waits
+  : > "$ba_tmp/calls"; : > "$ba_tmp/sleeps"
+  local f; f=$(ls "$ba_tmp"/retry.* | head -1)
+  PATH="$ba_tmp/bin:$PATH" bash -c 'set -euo pipefail; . "$1"; retry flaky "$2"; echo after' _ "$f" "$1" > /dev/null 2>&1
+  echo "$? $(wc -l < "$ba_tmp/calls") $(ba_sleeps)"
+}
+ck "retry: passes at once"           "$(ba_retry 0)" "0 1 "
+ck "retry: fails twice, then passes" "$(ba_retry 2)" "0 3 10 30 "
+ck "retry: fails three times: exit 7" "$(ba_retry 3)" "7 3 10 30 "
 # ci.yml's credential-helper job checks merge-branches.yml's copy.
 ck "the same credential helper"      "$(grep -h -E "^ *helper='" "$REPO"/.github/workflows/{merge-branches,bump-advisories,mirror-branches}.yml "$REPO"/.github/actions/bump-pr/action.yml | sed 's/^ *//' | sort -u | wc -l)" "1"
 
@@ -2370,7 +2465,7 @@ ns_run() { # result checked [env assignments]
   for a in "$@"; do [[ $a == GITHUB_RUN_ID=* ]] && id=${a#*=}; done
   env PATH="$ns_tmp/bin:$PATH" NS_TMP="$ns_tmp" GH_TOKEN=gh-tok RESULT="$result" CHECKED="$checked" \
     GITHUB_REPOSITORY=o/r GITHUB_REPOSITORY_ID=7 GITHUB_REF_NAME=staging GITHUB_EVENT_NAME=schedule \
-    GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/staging \
+    GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/staging GITHUB_WORKFLOW=CI \
     GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID="$id" GITHUB_SHA=0123456789abcdef \
     RUNNER_TEMP="$ns_tmp/runner" GITHUB_OUTPUT="$ns_tmp/output" "$@" bash "$ns_tmp/decide.sh" > "$ns_tmp/out" 2>&1
   local rc=$? art text
@@ -2390,8 +2485,8 @@ ns_run() { # result checked [env assignments]
   [ "$rc" = 0 ] || art="rc=$rc $art"
   echo "$art|$(sed -E 's#https://github.com/o/r/actions/runs/[0-9]+#<run>#' "$ns_tmp/posts" | tr '\n' ' ')"
 }
-ns_red="#ci :red_circle: o/r staging is red at 012345678: test (a), lint <run> "
-ns_green="#ci :large_green_circle: o/r staging is green again at 012345678 <run> "
+ns_red="#ci :red_circle: o/r \`CI\` on staging is red at 012345678: test (a), lint <run> "
+ns_green="#ci :large_green_circle: o/r \`CI\` on staging is green again at 012345678 <run> "
 ck "first run green: records, no post"  "$(ns_run success true)" "ci-state-ci.yml-staging-success|"
 ns_jobs "test (a)" lint
 ck "green -> red: posts the failed jobs" "$(ns_run failure true)" "ci-state-ci.yml-staging-failure|$ns_red"
@@ -2439,18 +2534,18 @@ ck "an earlier attempt of this run counts" "$(ns_run failure true GITHUB_RUN_ID=
    "ci-state-ci.yml-staging-success|$ns_green"
 ns_jobs j1 j2 j3 j4 j5 j6 j7
 ck "a long list is cut, a / is a -"     "$(ns_run failure true GITHUB_REF_NAME=feat/x)" \
-   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r feat/x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
+   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r \`CI\` on feat/x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
 # feat-x shares feat/x's artifact name, not its state.
 ck "a branch with the same name is not the same" "$(ns_run failure true GITHUB_REF_NAME=feat-x)" \
-   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r feat-x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
+   "ci-state-ci.yml-feat-x-failure|#ci :red_circle: o/r \`CI\` on feat-x is red at 012345678: j1, j2, j3, j4, j5 and 2 more <run> "
 ns_jobs "test (ubuntu-latest, stable)" "a&b<c>"
 ck "a comma in a job name is kept, markup escaped" "$(ns_run failure true GITHUB_REF_NAME='x<y>')" \
-   "ci-state-ci.yml-x-y--failure|#ci :red_circle: o/r x&lt;y&gt; is red at 012345678: test (ubuntu-latest, stable), a&amp;b&lt;c&gt; <run> "
+   "ci-state-ci.yml-x-y--failure|#ci :red_circle: o/r \`CI\` on x&lt;y&gt; is red at 012345678: test (ubuntu-latest, stable), a&amp;b&lt;c&gt; <run> "
 ns_jobs
 ck "no failed job found: the run alone" "$(ns_run failure true GITHUB_REF_NAME=b2)" \
-   "ci-state-ci.yml-b2-failure|#ci :red_circle: o/r b2 is red at 012345678: see the run <run> "
+   "ci-state-ci.yml-b2-failure|#ci :red_circle: o/r \`CI\` on b2 is red at 012345678: see the run <run> "
 ck "jobs not listed: the run, and warns" "$(ns_run failure true GITHUB_REF_NAME=b2a NS_JOBS_FAIL=1)$(grep -c "^::warning::Could not list the run's jobs" "$ns_tmp/out")" \
-   "ci-state-ci.yml-b2a-failure|#ci :red_circle: o/r b2a is red at 012345678: see the run <run> 1"
+   "ci-state-ci.yml-b2a-failure|#ci :red_circle: o/r \`CI\` on b2a is red at 012345678: see the run <run> 1"
 # A listing that fails warns: it is not the same as having no state. Either
 # listing: the first one's failure is not hidden by the second's success.
 ns_run failure true GITHUB_REF_NAME=b3 >/dev/null
@@ -2459,19 +2554,30 @@ for f in success failure; do
      "ci-state-ci.yml-b3-success|1"
 done
 ck "no run lookup: red posts"           "$(ns_run failure true GITHUB_REF_NAME=b3 NS_RUN_FAIL=1)$(grep -c '^::warning::Could not read' "$ns_tmp/out")" \
-   "ci-state-ci.yml-b3-failure|#ci :red_circle: o/r b3 is red at 012345678: see the run <run> 1"
+   "ci-state-ci.yml-b3-failure|#ci :red_circle: o/r \`CI\` on b3 is red at 012345678: see the run <run> 1"
 ck "first run red: posts"               "$(ns_run failure true GITHUB_REF_NAME=b4)" \
-   "ci-state-ci.yml-b4-failure|#ci :red_circle: o/r b4 is red at 012345678: see the run <run> "
+   "ci-state-ci.yml-b4-failure|#ci :red_circle: o/r \`CI\` on b4 is red at 012345678: see the run <run> "
 ck "another workflow has its own state" "$(ns_run success true GITHUB_REF_NAME=b4 GITHUB_WORKFLOW_REF=o/r/.github/workflows/nightly.yml@refs/heads/b4)" \
    "ci-state-nightly.yml-b4-success|"
+# Two workflows on one branch, each red in turn: each message names its own,
+# and the green one's recovery says nothing of the other.
+ns_ci=(GITHUB_REF_NAME=b7 GITHUB_WORKFLOW_REF=o/r/.github/workflows/ci.yml@refs/heads/b7 GITHUB_WORKFLOW=CI)
+ns_ba=(GITHUB_REF_NAME=b7 GITHUB_WORKFLOW_REF=o/r/.github/workflows/bump-advisories.yml@refs/heads/b7 GITHUB_WORKFLOW='Bump `crates` & advisories')
+ck "two workflows: CI's red names CI"   "$(ns_run failure true "${ns_ci[@]}")" \
+   "ci-state-ci.yml-b7-failure|#ci :red_circle: o/r \`CI\` on b7 is red at 012345678: see the run <run> "
+ck "the other's red names it, escaped"  "$(ns_run failure true "${ns_ba[@]}")" \
+   "ci-state-bump-advisories.yml-b7-failure|#ci :red_circle: o/r \`Bump 'crates' &amp; advisories\` on b7 is red at 012345678: see the run <run> "
+ck "its green names it alone"           "$(ns_run success true "${ns_ba[@]}")" \
+   "ci-state-bump-advisories.yml-b7-success|#ci :large_green_circle: o/r \`Bump 'crates' &amp; advisories\` on b7 is green again at 012345678 <run> "
+ck "and CI is still red"                "$(ns_run failure true "${ns_ci[@]}")" "ci-state-ci.yml-b7-failure|"
 # Ninety days of runs: the newest page is enough, and a page with none of
 # this branch's leads to the next.
 for i in $(seq 1 150); do ns_upload ci-state-ci.yml-b5-success "$i" b5 7 7 schedule .github/workflows/ci.yml; done
 ck "one page when it has the state"     "$(ns_run failure true GITHUB_REF_NAME=b5 GITHUB_RUN_ID=2000)$(tr '\n' ' ' < "$ns_tmp/listed")" \
-   "ci-state-ci.yml-b5-failure|#ci :red_circle: o/r b5 is red at 012345678: see the run <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-failure 1 "
+   "ci-state-ci.yml-b5-failure|#ci :red_circle: o/r \`CI\` on b5 is red at 012345678: see the run <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-failure 1 "
 for i in $(seq 1 100); do ns_upload ci-state-ci.yml-b5-success "$((3000 + i))" b5-other 7 7 schedule .github/workflows/ci.yml; done
 ck "the next page when it has not"      "$(ns_run success true GITHUB_REF_NAME=b5 GITHUB_RUN_ID=4000)$(tr '\n' ' ' < "$ns_tmp/listed")" \
-   "ci-state-ci.yml-b5-success|#ci :large_green_circle: o/r b5 is green again at 012345678 <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-success 2 ci-state-ci.yml-b5-failure 1 "
+   "ci-state-ci.yml-b5-success|#ci :large_green_circle: o/r \`CI\` on b5 is green again at 012345678 <run> ci-state-ci.yml-b5-success 1 ci-state-ci.yml-b5-success 2 ci-state-ci.yml-b5-failure 1 "
 # The record step, which ns_run stands in for. It comes before the post, so a
 # failed upload fails the job before Slack hears anything; overwrite lets a
 # re-run of the job upload the name again.

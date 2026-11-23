@@ -107,7 +107,9 @@ runs:
         # Slack reads &, < and > as markup.
         esc() { local s=${1//&/"&amp;"}; s=${s//</"&lt;"}; printf '%s' "${s//>/"&gt;"}"; }
         url="$GITHUB_SERVER_URL/$repo/actions/runs/$GITHUB_RUN_ID"
-        at="$repo $(esc "$branch") is"
+        # Each workflow on a branch has its own state, so the message names
+        # the workflow as GitHub shows it. A ` would end the code span.
+        at="$repo \`$(esc "${GITHUB_WORKFLOW//\`/\'}")\` on $(esc "$branch") is"
         sha=${GITHUB_SHA:0:9}
         text=
         if [ "$RESULT" = failure ] && [ "$prev" != failure ]; then
